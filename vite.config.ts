@@ -20,16 +20,40 @@ export default defineConfig(({mode}) => {
           theme_color: '#059669',
           icons: [
             {
-              src: 'pwa-192x192.png',
+              src: 'pwa-192x192.svg',
               sizes: '192x192',
-              type: 'image/png'
+              type: 'image/svg+xml',
+              purpose: 'any maskable'
             },
             {
-              src: 'pwa-512x512.png',
+              src: 'pwa-512x512.svg',
               sizes: '512x512',
-              type: 'image/png'
+              type: 'image/svg+xml',
+              purpose: 'any maskable'
             }
           ]
+        },
+        workbox: {
+          globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
+          runtimeCaching: [
+            {
+              urlPattern: /^https:\/\/images\.unsplash\.com\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'unsplash-images',
+                expiration: {
+                  maxEntries: 10,
+                  maxAgeSeconds: 60 * 60 * 24 * 30 // 30 Days
+                },
+                cacheableResponse: {
+                  statuses: [0, 200]
+                }
+              }
+            }
+          ]
+        },
+        devOptions: {
+          enabled: true
         }
       })
     ],

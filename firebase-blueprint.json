@@ -1,0 +1,83 @@
+{
+  "entities": {
+    "Commodity": {
+      "title": "Commodity",
+      "description": "Represents a fish or shrimp commodity being farmed.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "User ID of the owner" },
+        "name": { "type": "string", "description": "Name of the commodity" }
+      },
+      "required": ["uid", "name"]
+    },
+    "Report": {
+      "title": "Report",
+      "description": "A daily or periodic report for a commodity.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "date": { "type": "string" },
+        "commodity_id": { "type": "string" },
+        "commodity_name": { "type": "string" },
+        "code": { "type": "string" },
+        "quantity": { "type": "number" },
+        "status": { "type": "string" },
+        "size_category": { "type": "string" },
+        "harvest": { "type": "number" },
+        "medium": { "type": "number" },
+        "small": { "type": "number" },
+        "jumbo": { "type": "number" },
+        "notes": { "type": "string" },
+        "sorting_date": { "type": "string" },
+        "price": { "type": "number" },
+        "formSection": { "type": "string" }
+      },
+      "required": ["uid", "date", "commodity_id"]
+    },
+    "Harvest": {
+      "title": "Harvest",
+      "description": "A harvest record.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "date": { "type": "string" },
+        "commodity_id": { "type": "string" },
+        "commodity_name": { "type": "string" },
+        "total_harvest": { "type": "number" },
+        "notes": { "type": "string" }
+      },
+      "required": ["uid", "date", "commodity_id", "total_harvest"]
+    },
+    "FeedData": {
+      "title": "FeedData",
+      "description": "A feed record.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "date": { "type": "string" },
+        "feed_type": { "type": "string" },
+        "quantity": { "type": "number" },
+        "notes": { "type": "string" }
+      },
+      "required": ["uid", "date", "feed_type", "quantity"]
+    },
+    "User": {
+      "title": "User",
+      "description": "User profile and role.",
+      "type": "object",
+      "properties": {
+        "displayName": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "user"] }
+      },
+      "required": ["displayName", "email", "role"]
+    }
+  },
+  "firestore": {
+    "/commodities/{id}": { "schema": "Commodity", "description": "User's commodities" },
+    "/reports/{id}": { "schema": "Report", "description": "User's reports" },
+    "/harvests/{id}": { "schema": "Harvest", "description": "User's harvests" },
+    "/feed_data/{id}": { "schema": "FeedData", "description": "User's feed records" },
+    "/users/{userId}": { "schema": "User", "description": "User profiles" }
+  }
+}

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo, Component, ErrorInfo, ReactNode } from 'react';
 import { 
   Plus, 
   FileText, 
@@ -15,6 +15,7 @@ import {
   Share2, 
   Camera, 
   Bell,
+  Menu,
   ChevronLeft,
   ChevronRight,
   ChevronDown,
@@ -24,11 +25,12 @@ import {
   AlertCircle,
   X,
   Calendar,
-  Zap,
   User,
   UserCircle,
-  Fish,
-  Anchor
+  Anchor,
+  AlertTriangle,
+  RefreshCw,
+  LogOut
 } from 'lucide-react';
 import { 
   LineChart, 
@@ -48,8 +50,29 @@ import 'jspdf-autotable';
 import * as XLSX from 'xlsx';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
-import Dexie, { type EntityTable } from 'dexie';
-import { useLiveQuery } from 'dexie-react-hooks';
+import { 
+  signInWithPopup, 
+  GoogleAuthProvider, 
+  onAuthStateChanged, 
+  signOut,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  updateProfile,
+  type User as FirebaseUser
+} from 'firebase/auth';
+import { 
+  collection, 
+  addDoc, 
+  updateDoc, 
+  deleteDoc, 
+  doc, 
+  onSnapshot, 
+  query, 
+  where,
+  getDocs,
+  getDocFromServer
+} from 'firebase/firestore';
+import { db as firestoreDb, auth, handleFirestoreError, OperationType, type FirestoreErrorInfo } from './firebase';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -66,32 +89,53 @@ const APP_LOGO_URL = "data:image/jpeg;base64,/9j/4SNQRXhpZgAATU0AKgAAAAgADAEAAAM
 
 // Database Setup (Offline)
 interface Commodity {
-  id?: number;
+  id?: string;
+  uid: string;
   name: string;
 }
 
+interface FeedEntry {
+  feed_type: string;
+  quantity: number;
+}
+
 interface FeedData {
-  id?: number;
+  id?: string;
+  uid: string;
   date: string;
   feed_type: string;
   quantity: number;
   notes: string;
+  feed_entries?: FeedEntry[];
+  updatedAt?: string;
 }
 
 interface HarvestData {
-  id?: number;
-  commodity_id: number;
+  id?: string;
+  uid: string;
+  commodity_id: string;
   commodity_name: string;
   date: string;
   total_harvest: number;
   notes: string;
+  updatedAt?: string;
+}
+
+interface KerambaEntry {
+  code: string;
+  harvest: number;
+  medium: number;
+  small: number;
+  jumbo: number;
 }
 
 interface ReportData {
-  id?: number;
-  commodity_id: number;
+  id?: string;
+  uid: string;
+  commodity_id: string;
   commodity_name: string;
   date: string;
+  updatedAt?: string;
   supplier: string;
   quantity: number;
   status: string;
@@ -103,35 +147,12 @@ interface ReportData {
   jumbo: number;
   code: string;
   notes: string;
+  description?: string;
   sorting_date: string;
   price?: number;
   formSection?: string;
+  keramba_entries?: KerambaEntry[];
 }
-
-const db = new Dexie('TambakDB') as Dexie & {
-  commodities: EntityTable<Commodity, 'id'>;
-  reports: EntityTable<ReportData, 'id'>;
-  harvests: EntityTable<HarvestData, 'id'>;
-  feed_data: EntityTable<FeedData, 'id'>;
-};
-
-db.version(4).stores({
-  commodities: '++id, name',
-  reports: '++id, commodity_id, commodity_name, date, supplier, status',
-  harvests: '++id, commodity_id, commodity_name, date',
-  feed_data: '++id, date, feed_type'
-});
-
-// Seed initial data if empty
-db.on('populate', () => {
-  db.commodities.bulkAdd([
-    { name: 'Lele' },
-    { name: 'Patin' },
-    { name: 'Nila' },
-    { name: 'Bawal' },
-    { name: 'Gurami' }
-  ]);
-});
 
 // Types
 // (Removed duplicate interfaces)
@@ -140,44 +161,49 @@ db.on('populate', () => {
 const Card = ({ children, className, onClick }: { children: React.ReactNode; className?: string; onClick?: () => void }) => (
   <div 
     onClick={onClick}
-    className={cn("bg-white/90 backdrop-blur-md rounded-2xl shadow-lg border border-white/20 overflow-hidden", className, onClick && "cursor-pointer active:scale-[0.98] transition-transform")}
+    className={cn(
+      "glass rounded-3xl shadow-xl border border-white/40 overflow-hidden transition-all duration-300", 
+      className, 
+      onClick && "cursor-pointer hover:shadow-2xl hover:-translate-y-1 active:scale-[0.98]"
+    )}
   >
     {children}
   </div>
 );
 
-const Button = ({ 
+const Button = React.forwardRef<HTMLButtonElement, { 
+  children: React.ReactNode; 
+  onClick?: (e?: React.MouseEvent) => void; 
+  variant?: 'primary' | 'secondary' | 'danger' | 'ghost' | 'glass';
+  className?: string;
+  disabled?: boolean;
+  type?: 'button' | 'submit' | 'reset';
+}>(({ 
   children, 
   onClick, 
   variant = 'primary', 
   className,
   disabled,
   type = 'button'
-}: { 
-  children: React.ReactNode; 
-  onClick?: (e?: React.MouseEvent) => void; 
-  variant?: 'primary' | 'secondary' | 'danger' | 'ghost';
-  className?: string;
-  disabled?: boolean;
-  type?: 'button' | 'submit' | 'reset';
-}) => {
+}, ref) => {
   const variants = {
-    primary: "bg-emerald-600 text-white hover:bg-emerald-700",
-    secondary: "bg-white text-emerald-700 border border-emerald-200 hover:bg-emerald-50",
-    danger: "bg-rose-500 text-white hover:bg-rose-600",
-    ghost: "bg-transparent text-gray-600 hover:bg-gray-100"
+    primary: "bg-emerald-600 text-white hover:bg-emerald-700 shadow-lg shadow-emerald-200",
+    secondary: "bg-white text-emerald-700 border border-emerald-100 hover:bg-emerald-50 shadow-sm",
+    danger: "bg-rose-500 text-white hover:bg-rose-600 shadow-lg shadow-rose-200",
+    ghost: "bg-transparent text-slate-600 hover:bg-slate-100",
+    glass: "glass text-emerald-900 hover:bg-white/50"
   };
 
   return (
     <button 
+      ref={ref}
       type={type}
       onClick={(e) => {
-        console.log("Button internal onClick triggered");
         onClick?.(e);
       }}
       disabled={disabled}
       className={cn(
-        "px-4 py-2 rounded-xl font-medium transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50",
+        "px-5 py-2.5 rounded-2xl font-semibold transition-all active:scale-95 flex items-center justify-center gap-2 disabled:opacity-50 disabled:pointer-events-none",
         variants[variant],
         className
       )}
@@ -185,7 +211,37 @@ const Button = ({
       {children}
     </button>
   );
-};
+});
+
+const ALL_POND_CODES = [
+  ...Array.from({ length: 14 }, (_, i) => `B.A${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 6 }, (_, i) => `B.B${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 14 }, (_, i) => `B.C${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 6 }, (_, i) => `B.D${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 9 }, (_, i) => `A${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 8 }, (_, i) => `B${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 5 }, (_, i) => `C${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 5 }, (_, i) => `D${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 8 }, (_, i) => `K.B ${(i + 1).toString().padStart(2, '0')}`),
+  ...Array.from({ length: 4 }, (_, i) => `K.T${i + 1}`),
+];
+
+const PageHeader = ({ title, onBack, rightElement }: { title: string; onBack?: () => void; rightElement?: React.ReactNode }) => (
+  <div className="flex items-center justify-between mb-6 animate-in fade-in slide-in-from-top-4 duration-500">
+    <div className="flex items-center gap-3">
+      {onBack && (
+        <button 
+          onClick={onBack} 
+          className="p-2 text-white hover:opacity-70 transition-all active:scale-90"
+        >
+          <ChevronLeft size={24} />
+        </button>
+      )}
+      <h2 className="text-2xl font-bold text-white drop-shadow-md tracking-tight">{title}</h2>
+    </div>
+    {rightElement}
+  </div>
+);
 
 // Custom Icon matching the user's provided image
 const LoginUserIcon = ({ size = 100, className = "" }: { size?: number, className?: string }) => (
@@ -213,29 +269,323 @@ const LoginUserIcon = ({ size = 100, className = "" }: { size?: number, classNam
   </svg>
 );
 
-export default function App() {
-  const [view, setView] = useState<'login' | 'register' | 'home' | 'list' | 'form' | 'stats' | 'reminders' | 'panen' | 'commodities' | 'search_landing' | 'commodity_dashboard' | 'bibit_list' | 'keramba_list' | 'pakan_ikan'>('home');
+class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean, error: Error | null }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let errorMessage = "Terjadi kesalahan yang tidak terduga.";
+      let firestoreInfo: FirestoreErrorInfo | null = null;
+
+      try {
+        if (this.state.error?.message) {
+          firestoreInfo = JSON.parse(this.state.error.message);
+          if (firestoreInfo && firestoreInfo.error) {
+            if (firestoreInfo.error.includes("Missing or insufficient permissions")) {
+              errorMessage = `Kesalahan Izin Firestore: Anda tidak memiliki izin untuk melakukan operasi ${firestoreInfo.operationType} pada jalur ${firestoreInfo.path}.`;
+            } else {
+              errorMessage = `Kesalahan Firestore: ${firestoreInfo.error}`;
+            }
+          }
+        }
+      } catch (e) {
+        // Not a JSON error message, use standard error message
+        errorMessage = this.state.error?.message || errorMessage;
+      }
+
+      return (
+        <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-xl p-8 max-w-md w-full text-center border border-gray-100">
+            <div className="w-20 h-20 bg-rose-100 rounded-full flex items-center justify-center mx-auto mb-6">
+              <AlertTriangle className="w-10 h-10 text-rose-600" />
+            </div>
+            <h1 className="text-2xl font-bold text-gray-900 mb-4">Ups! Terjadi Kesalahan</h1>
+            <p className="text-gray-600 mb-8 leading-relaxed">
+              {errorMessage}
+            </p>
+            <div className="space-y-3">
+              <Button 
+                onClick={() => window.location.reload()} 
+                className="w-full py-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-2xl font-semibold shadow-lg shadow-emerald-200 transition-all active:scale-95 flex items-center justify-center gap-2"
+              >
+                <RefreshCw className="w-5 h-5" />
+                Muat Ulang Aplikasi
+              </Button>
+              <Button 
+                variant="secondary"
+                onClick={() => this.setState({ hasError: false, error: null })} 
+                className="w-full py-4 rounded-2xl font-semibold"
+              >
+                Coba Lagi
+              </Button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+export default function AppWithErrorBoundary() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
+
+function App() {
+  const [view, setView] = useState<'login' | 'register' | 'home' | 'list' | 'form' | 'stats' | 'reminders' | 'panen' | 'commodities' | 'commodity_dashboard' | 'bibit_list' | 'keramba_list' | 'pakan_ikan'>('home');
   const [formSection, setFormSection] = useState<'data_masuk' | 'klarifikasi_ukuran' | 'pakan_ikan' | 'all'>('all');
   const [actionType, setActionType] = useState<'create' | 'update' | 'delete'>('create');
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [loginData, setLoginData] = useState({ name: '', password: '' });
-  const commodities = useLiveQuery(() => db.commodities.toArray()) || [];
-  const reports = useLiveQuery(() => db.reports.toArray()) || [];
-  const harvests = useLiveQuery(() => db.harvests.toArray()) || [];
-  const feedData = useLiveQuery(() => db.feed_data.toArray()) || [];
-  const [selectedCommodity, setSelectedCommodity] = useState<number | null>(null);
+  
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [authLoading, setAuthLoading] = useState(false);
+  
+  const [commodities, setCommodities] = useState<Commodity[]>([]);
+  const [reports, setReports] = useState<ReportData[]>([]);
+  const [harvests, setHarvests] = useState<HarvestData[]>([]);
+  const [feedData, setFeedData] = useState<FeedData[]>([]);
+
+  const [selectedCommodity, setSelectedCommodity] = useState<string | null>(null);
   const [editingReport, setEditingReport] = useState<ReportData | null>(null);
+  const [editingFeed, setEditingFeed] = useState<FeedData | null>(null);
+  const [editingHarvest, setEditingHarvest] = useState<HarvestData | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showAll, setShowAll] = useState(false);
   const [isFormExpanded, setIsFormExpanded] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isSizeInfoExpanded, setIsSizeInfoExpanded] = useState(true);
+  const [isKerambaSizeInfoExpanded, setIsKerambaSizeInfoExpanded] = useState(true);
   const [reminders, setReminders] = useState<{id: string, date: string, note: string}[]>([]);
-  const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
+  const [deleteType, setDeleteType] = useState<'report' | 'feed' | 'harvest'>('report');
   const [showSuccess, setShowSuccess] = useState(false);
+  const [successType, setSuccessType] = useState<'bibit' | 'keramba'>('bibit');
+  const [isSaving, setIsSaving] = useState(false);
   const [pondFilter, setPondFilter] = useState('');
-  const [notesFilter, setNotesFilter] = useState('');
-  const [showSortingSuccess, setShowSortingSuccess] = useState(false);
+  const [isSearchPerformed, setIsSearchPerformed] = useState(false);
   const [showHarvestSuccess, setShowHarvestSuccess] = useState(false);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [dbError, setDbError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const submitButtonRef = useRef<HTMLButtonElement>(null);
+
+  const uniqueCommodities = useMemo(() => {
+    const seen = new Set();
+    return commodities.filter(c => {
+      const nameLower = c.name.toLowerCase().trim();
+      if (seen.has(nameLower)) return false;
+      seen.add(nameLower);
+      return true;
+    });
+  }, [commodities]);
+
+  const totalBibit = useMemo(() => {
+    return reports
+      .filter(r => r.commodity_id === selectedCommodity && r.formSection === 'data_masuk')
+      .reduce((sum, r) => sum + (r.quantity || 0), 0);
+  }, [reports, selectedCommodity]);
+
+  const totalKolam = useMemo(() => {
+    const uniqueCodes = new Set(
+      reports
+        .filter(r => r.commodity_id === selectedCommodity && r.formSection === 'klarifikasi_ukuran' && r.code)
+        .map(r => r.code)
+    );
+    return uniqueCodes.size;
+  }, [reports, selectedCommodity]);
+
+  const globalTotalBibit = useMemo(() => {
+    return reports
+      .filter(r => r.formSection === 'data_masuk')
+      .reduce((sum, r) => sum + (r.quantity || 0), 0);
+  }, [reports]);
+
+  const globalTotalPakan = useMemo(() => {
+    return feedData.reduce((sum, f) => sum + (f.quantity || 0), 0);
+  }, [feedData]);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      console.log("Auth state changed:", currentUser ? `User: ${currentUser.email}` : "No user");
+      setUser(currentUser);
+      setIsAuthReady(true);
+      if (currentUser) {
+        // Test connection
+        const testConn = async () => {
+          try {
+            await getDocFromServer(doc(firestoreDb, 'test', 'connection'));
+          } catch (error) {
+            if (error instanceof Error && error.message.includes('the client is offline')) {
+              console.error("Please check your Firebase configuration.");
+              setDbError("Koneksi database gagal. Silakan periksa konfigurasi Firebase Anda.");
+            }
+          }
+        };
+        testConn();
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setCommodities([]);
+      setReports([]);
+      setHarvests([]);
+      setFeedData([]);
+      return;
+    }
+
+    const qCommodities = query(collection(firestoreDb, 'commodities'), where('uid', '==', user.uid));
+    const unsubCommodities = onSnapshot(qCommodities, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Commodity));
+      setCommodities(data);
+      
+      // Seed if empty
+      if (data.length === 0) {
+        const initial = ['Lele', 'Patin', 'Nila', 'Bawal', 'Gurami'];
+        initial.forEach(async (name) => {
+          try {
+            await addDoc(collection(firestoreDb, 'commodities'), { uid: user.uid, name });
+          } catch (error) {
+            handleFirestoreError(error, OperationType.CREATE, 'commodities');
+          }
+        });
+      }
+    }, (error) => handleFirestoreError(error, OperationType.GET, 'commodities'));
+
+    const qReports = query(collection(firestoreDb, 'reports'), where('uid', '==', user.uid));
+    const unsubReports = onSnapshot(qReports, (snapshot) => {
+      setReports(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as ReportData)));
+    }, (error) => handleFirestoreError(error, OperationType.GET, 'reports'));
+
+    const qHarvests = query(collection(firestoreDb, 'harvests'), where('uid', '==', user.uid));
+    const unsubHarvests = onSnapshot(qHarvests, (snapshot) => {
+      setHarvests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as HarvestData)));
+    }, (error) => handleFirestoreError(error, OperationType.GET, 'harvests'));
+
+    const qFeed = query(collection(firestoreDb, 'feed_data'), where('uid', '==', user.uid));
+    const unsubFeed = onSnapshot(qFeed, (snapshot) => {
+      setFeedData(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as FeedData)));
+    }, (error) => handleFirestoreError(error, OperationType.GET, 'feed_data'));
+
+    return () => {
+      unsubCommodities();
+      unsubReports();
+      unsubHarvests();
+      unsubFeed();
+    };
+  }, [user]);
+
+  const handleGoogleSignIn = async () => {
+    const provider = new GoogleAuthProvider();
+    setAuthLoading(true);
+    setAuthError(null);
+    try {
+      await signInWithPopup(auth, provider);
+      setView('home');
+    } catch (error: any) {
+      console.error("Error signing in", error);
+      if (error.code === 'auth/popup-closed-by-user') {
+        setAuthError("Jendela login ditutup sebelum selesai.");
+      } else if (error.code === 'auth/cancelled-by-user') {
+        setAuthError("Login dibatalkan.");
+      } else if (error.code === 'auth/popup-blocked') {
+        setAuthError("Popup diblokir oleh browser. Silakan izinkan popup untuk login.");
+      } else if (error.code === 'auth/account-exists-with-different-credential') {
+        setAuthError("Akun sudah ada dengan metode login yang berbeda.");
+      } else {
+        setAuthError("Gagal login dengan Google: " + error.message);
+      }
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleEmailSignIn = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthLoading(true);
+    try {
+      await signInWithEmailAndPassword(auth, email.trim(), password);
+      setView('home');
+    } catch (error: any) {
+      console.error("Error signing in", error);
+      if (error.code === 'auth/user-not-found') {
+        setAuthError("Email tidak terdaftar. Silakan buat akun baru.");
+      } else if (error.code === 'auth/wrong-password') {
+        setAuthError("Password salah. Silakan coba lagi.");
+      } else if (error.code === 'auth/invalid-credential') {
+        setAuthError("Email atau password salah.");
+      } else if (error.code === 'auth/invalid-email') {
+        setAuthError("Format email tidak valid.");
+      } else if (error.code === 'auth/user-disabled') {
+        setAuthError("Akun ini telah dinonaktifkan.");
+      } else if (error.code === 'auth/too-many-requests') {
+        setAuthError("Terlalu banyak percobaan login. Silakan coba lagi nanti.");
+      } else {
+        setAuthError("Gagal login: " + error.message);
+      }
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleEmailRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError(null);
+    setAuthLoading(true);
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, email.trim(), password);
+      if (displayName) {
+        await updateProfile(userCredential.user, { displayName });
+      }
+      setView('home');
+    } catch (error: any) {
+      console.error("Error registering", error);
+      if (error.code === 'auth/email-already-in-use') {
+        setAuthError("Email sudah terdaftar. Silakan gunakan email lain atau login.");
+      } else if (error.code === 'auth/weak-password') {
+        setAuthError("Password terlalu lemah. Gunakan minimal 6 karakter.");
+      } else if (error.code === 'auth/invalid-email') {
+        setAuthError("Format email tidak valid.");
+      } else if (error.code === 'auth/operation-not-allowed') {
+        setAuthError("Pendaftaran dengan email/password tidak diizinkan.");
+      } else {
+        setAuthError("Gagal mendaftar: " + error.message);
+      }
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await signOut(auth);
+      setView('home');
+    } catch (error) {
+      console.error("Error signing out", error);
+    }
+  };
 
   const scroll = (direction: 'left' | 'right') => {
     if (scrollRef.current) {
@@ -246,16 +596,42 @@ export default function App() {
   };
 
   const [harvestForm, setHarvestForm] = useState<Partial<HarvestData>>({
-    date: new Date().toISOString().split('T')[0],
+    date: format(new Date(), 'yyyy-MM-dd'),
     total_harvest: 0,
     notes: ''
   });
+
+  const [analisaForm, setAnalisaForm] = useState({
+    jumlahBibit: 0,
+    persentaseGagal: 20,
+    fcr: 1,
+    totalPakan: 0,
+    modalPerKg: 16000,
+    hargaJualPerKg: 20000
+  });
+
+  const analisaResult = useMemo(() => {
+    const estimasiPanen = analisaForm.fcr > 0 ? analisaForm.totalPakan / analisaForm.fcr : 0;
+    const totalModal = estimasiPanen * analisaForm.modalPerKg;
+    const totalOmzet = estimasiPanen * analisaForm.hargaJualPerKg;
+    const keuntungan = totalOmzet - totalModal;
+    const survivors = analisaForm.jumlahBibit * (1 - analisaForm.persentaseGagal / 100);
+
+    return {
+      estimasiPanen,
+      totalModal,
+      totalOmzet,
+      keuntungan,
+      survivors
+    };
+  }, [analisaForm]);
   
   const [feedForm, setFeedForm] = useState<Partial<FeedData>>({
-    date: new Date().toISOString().split('T')[0],
+    date: format(new Date(), 'yyyy-MM-dd'),
     feed_type: 'pf 500',
     quantity: 0,
-    notes: ''
+    notes: '',
+    feed_entries: []
   });
 
   const [isFeedFormExpanded, setIsFeedFormExpanded] = useState(false);
@@ -263,8 +639,8 @@ export default function App() {
 
   // Form State
   const [formData, setFormData] = useState<Partial<ReportData>>({
-    date: new Date().toISOString().split('T')[0],
-    sorting_date: new Date().toISOString().split('T')[0],
+    date: format(new Date(), 'yyyy-MM-dd'),
+    sorting_date: format(new Date(), 'yyyy-MM-dd'),
     quantity: 0,
     harvest: 0,
     medium: 0,
@@ -274,56 +650,24 @@ export default function App() {
     size_category: '1 in',
     price: 0,
     notes: '',
-    formSection: 'data_masuk'
+    description: '',
+    formSection: 'data_masuk',
+    keramba_entries: []
   });
 
   useEffect(() => {
     const savedReminders = localStorage.getItem('tambak_reminders');
     if (savedReminders) setReminders(JSON.parse(savedReminders));
-    
-    // Robust update for existing users
-    const updateCommodities = async () => {
-      const all = await db.commodities.toArray();
-      
-      // 1. Rename old names if they exist
-      for (const c of all) {
-        if (c.name === 'Udang Vaname') await db.commodities.update(c.id!, { name: 'Lele' });
-        if (c.name === 'Ikan Bandeng') await db.commodities.update(c.id!, { name: 'Patin' });
-        if (c.name === 'Ikan Nila') await db.commodities.update(c.id!, { name: 'Nila' });
-      }
-
-      // 2. Ensure all required names exist and remove duplicates
-      const allUpdated = await db.commodities.toArray();
-      const required = ['Lele', 'Patin', 'Nila', 'Bawal', 'Gurami'];
-      
-      // Remove duplicates first
-      const seen = new Set();
-      for (const c of allUpdated) {
-        const nameKey = c.name.toLowerCase().trim();
-        if (seen.has(nameKey)) {
-          await db.commodities.delete(c.id!);
-        } else {
-          seen.add(nameKey);
-        }
-      }
-
-      const currentNames = (await db.commodities.toArray()).map(c => c.name);
-      for (const name of required) {
-        if (!currentNames.includes(name)) {
-          await db.commodities.add({ name });
-        }
-      }
-    };
-
-    updateCommodities();
   }, []);
 
   useEffect(() => {
     setShowAll(false);
     setSearchQuery('');
+    setPondFilter('');
+    setIsSearchPerformed(false);
   }, [view]);
 
-  const getCommodityName = (id: number | null) => {
+  const getCommodityName = (id: string | null) => {
     return commodities.find(c => c.id === id)?.name || '';
   };
 
@@ -334,57 +678,203 @@ export default function App() {
     return reminderDate <= today;
   });
 
+  const addKerambaEntry = () => {
+    const newEntry: KerambaEntry = {
+      code: formData.code || '',
+      harvest: Number(formData.harvest) || 0,
+      medium: Number(formData.medium) || 0,
+      small: Number(formData.small) || 0,
+      jumbo: Number(formData.jumbo) || 0
+    };
+
+    if (!newEntry.code) {
+      alert("Pilih Kode Kolam terlebih dahulu");
+      return;
+    }
+
+    // Check for duplicates in current entries
+    if (formData.keramba_entries?.some(e => e.code === newEntry.code)) {
+      alert("Kode kolam ini sudah ada dalam daftar.");
+      return;
+    }
+
+    const updatedEntries = [...(formData.keramba_entries || []), newEntry];
+    
+    // Format notes
+    const entriesText = updatedEntries.map(entry => {
+      const parts = [];
+      if (entry.harvest > 0) parts.push(`P:${entry.harvest}kg`);
+      if (entry.medium > 0) parts.push(`S:${entry.medium}kg`);
+      if (entry.small > 0) parts.push(`K:${entry.small}kg`);
+      if (entry.jumbo > 0) parts.push(`J:${entry.jumbo}kg`);
+      return `${entry.code} (${parts.join(', ')})`;
+    }).join('\n');
+
+    setFormData({
+      ...formData,
+      keramba_entries: updatedEntries,
+      notes: entriesText,
+      harvest: 0,
+      medium: 0,
+      small: 0,
+      jumbo: 0,
+      code: ''
+    });
+  };
+
+  const removeKerambaEntry = (index: number) => {
+    const updatedEntries = (formData.keramba_entries || []).filter((_, i) => i !== index);
+    
+    // Format notes
+    const entriesText = updatedEntries.map(entry => {
+      const parts = [];
+      if (entry.harvest > 0) parts.push(`P:${entry.harvest}kg`);
+      if (entry.medium > 0) parts.push(`S:${entry.medium}kg`);
+      if (entry.small > 0) parts.push(`K:${entry.small}kg`);
+      if (entry.jumbo > 0) parts.push(`J:${entry.jumbo}kg`);
+      return `${entry.code} (${parts.join(', ')})`;
+    }).join('\n');
+
+    setFormData({
+      ...formData,
+      keramba_entries: updatedEntries,
+      notes: entriesText
+    });
+  };
+
   const handleSaveReport = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSaving) return;
     
-    const targetCommodityId = formData.commodity_id || selectedCommodity;
-    const commodity = commodities.find(c => c.id === targetCommodityId);
-    const reportToSave = {
-      ...formData,
-      commodity_id: targetCommodityId!,
-      commodity_name: commodity?.name || 'Unknown'
-    } as ReportData;
+    console.log("handleSaveReport triggered", { view, formSection, formData });
+    
+    if (!user) {
+      console.error("No user logged in");
+      return;
+    }
 
+    setIsSaving(true);
     try {
+      const targetCommodityId = formData.commodity_id || selectedCommodity;
+      console.log("Target Commodity ID:", targetCommodityId);
+      
+      if (!targetCommodityId) {
+        alert("Mohon pilih komoditas terlebih dahulu.");
+        setIsSaving(false);
+        return;
+      }
+
+      const commodity = commodities.find(c => c.id === targetCommodityId) || 
+                        commodities.find(c => c.name.toLowerCase() === 'bawal'); // Fallback for Bawal if ID mismatch
+      
+      // Determine the correct formSection to save
+      let sectionToSave = formData.formSection || formSection;
+      if (view === 'bibit_list') sectionToSave = 'data_masuk';
+      if (view === 'keramba_list') sectionToSave = 'klarifikasi_ukuran';
+      if (sectionToSave === 'all') sectionToSave = 'data_masuk'; // Default fallback
+
+      const reportToSave = {
+        ...formData,
+        uid: user.uid,
+        commodity_id: targetCommodityId,
+        commodity_name: commodity?.name || 'Bawal', // Default to Bawal if we're likely in Bawal context
+        formSection: sectionToSave,
+        updatedAt: new Date().toISOString()
+      } as ReportData;
+
+      // If there are keramba entries, sum them up for compatibility with existing stats/list
+      if (formData.keramba_entries && formData.keramba_entries.length > 0) {
+        reportToSave.harvest = formData.keramba_entries.reduce((sum, e) => sum + (Number(e.harvest) || 0), 0);
+        reportToSave.medium = formData.keramba_entries.reduce((sum, e) => sum + (Number(e.medium) || 0), 0);
+        reportToSave.small = formData.keramba_entries.reduce((sum, e) => sum + (Number(e.small) || 0), 0);
+        reportToSave.jumbo = formData.keramba_entries.reduce((sum, e) => sum + (Number(e.jumbo) || 0), 0);
+        reportToSave.code = formData.keramba_entries.map(e => e.code).join(', ');
+      }
+
+      // Duplicate check before saving
+      if (reportToSave.code) {
+        const codesToSave = reportToSave.code.split(',').map(c => c.trim());
+        for (const code of codesToSave) {
+          const isDuplicate = reports.some(r => {
+            if (r.id === editingReport?.id) return false;
+            if (!r.code) return false;
+            
+            const existingCodes = r.code.split(',').map(c => c.trim());
+            const hasCode = existingCodes.includes(code);
+            
+            if (sectionToSave === 'data_masuk') {
+              // For Data Bibit, block if used in ANY report
+              return hasCode;
+            } else if (sectionToSave === 'klarifikasi_ukuran') {
+              // For Data Keramba, block if used in another Data Keramba report
+              return r.formSection === 'klarifikasi_ukuran' && hasCode;
+            }
+            return false;
+          });
+          
+          if (isDuplicate) {
+            alert(`Kode kolam ${code} sudah digunakan dalam data lain.`);
+            setIsSaving(false);
+            return;
+          }
+        }
+      }
+
+      console.log("Saving report:", reportToSave);
+
       if (editingReport?.id) {
-        await db.reports.update(editingReport.id, reportToSave);
+        console.log("Updating existing report:", editingReport.id);
+        await updateDoc(doc(firestoreDb, 'reports', editingReport.id), reportToSave as any);
+        setView('list'); // Go back to list after edit
+        setSelectedCommodity(null); // Return to main search result
+        setSearchQuery(''); // Reset search query
+        setShowAll(false); // Reset show all
       } else {
-        await db.reports.add(reportToSave);
+        console.log("Adding new report");
+        await addDoc(collection(firestoreDb, 'reports'), reportToSave);
       }
       
       // If we are in a specific list view, stay there. Otherwise go to generic list.
-      if (!(view === 'bibit_list' || view === 'keramba_list')) {
+      if (!(view === 'bibit_list' || view === 'keramba_list' || view === 'list')) {
         setView('list');
       }
       
       setEditingReport(null);
+      setSuccessType(sectionToSave === 'data_masuk' ? 'bibit' : 'keramba');
       setFormData({
-        date: new Date().toISOString().split('T')[0],
-        sorting_date: new Date().toISOString().split('T')[0],
+        date: format(new Date(), 'yyyy-MM-dd'),
+        sorting_date: format(new Date(), 'yyyy-MM-dd'),
         quantity: 0,
         status: 'Sehat',
         size_category: '1 in',
         price: 0,
         notes: '',
+        description: '',
         harvest: 0,
         medium: 0,
         small: 0,
         jumbo: 0,
-        code: ''
+        code: '',
+        keramba_entries: [],
+        formSection: sectionToSave // Keep the section for next entry
       });
       
-      if (view === 'bibit_list' || view === 'keramba_list') {
+      if (view === 'bibit_list' || view === 'keramba_list' || view === 'list') {
         setShowSuccess(true);
         setTimeout(() => setShowSuccess(false), 3000);
       } else {
         alert("Data berhasil disimpan!");
       }
     } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'reports');
       console.error("Error saving report", error);
+      alert("Gagal menyimpan data: " + (error instanceof Error ? error.message : String(error)));
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  const handleDeleteReport = async (id: number | undefined) => {
+  const handleDeleteReport = async (id: string | undefined) => {
     console.log("handleDeleteReport execution for id:", id);
     if (id === undefined) {
       console.error("Delete failed: ID is undefined");
@@ -393,78 +883,123 @@ export default function App() {
     }
     
     try {
-      console.log("Executing db.reports.delete for id:", id);
-      await db.reports.delete(id);
-      console.log("Delete successful from DB");
+      console.log("Executing deleteDoc for id:", id);
+      await deleteDoc(doc(firestoreDb, 'reports', id));
+      console.log("Delete successful from Firestore");
       setDeleteConfirmId(null);
       alert("Laporan berhasil dihapus.");
     } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, 'reports');
       console.error("Error deleting report", error);
       alert("Gagal menghapus: " + (error instanceof Error ? error.message : String(error)));
     }
   };
 
-  const handleQuickSaveSorting = async () => {
-    if (!pondFilter) {
-      alert("Silakan pilih kode kolam terlebih dahulu.");
+  const addFeedEntry = () => {
+    const newEntry: FeedEntry = {
+      feed_type: feedForm.feed_type || 'pf 500',
+      quantity: Number(feedForm.quantity) || 0
+    };
+
+    if (newEntry.quantity <= 0) {
+      alert("Jumlah pakan harus lebih dari 0");
       return;
     }
 
-    const reportToSave = {
-      date: new Date().toISOString().split('T')[0],
-      sorting_date: searchQuery || new Date().toISOString().split('T')[0],
-      code: pondFilter,
-      notes: notesFilter,
-      formSection: 'klarifikasi_ukuran',
-      commodity_id: selectedCommodity || 1, // Default to first commodity if none selected
-      commodity_name: commodities.find(c => c.id === selectedCommodity)?.name || 'Lele',
-      quantity: 0,
-      harvest: 0,
-      medium: 0,
-      small: 0,
-      jumbo: 0,
-      status: 'Sehat',
-      size_category: '1 in',
-      price: 0
-    } as ReportData;
+    const updatedEntries = [...(feedForm.feed_entries || []), newEntry];
+    
+    // Format notes
+    const entriesText = updatedEntries.map(entry => 
+      `${entry.feed_type} = ${entry.quantity} sak`
+    ).join('\n');
 
-    try {
-      await db.reports.add(reportToSave);
-      setShowSortingSuccess(true);
-      setTimeout(() => setShowSortingSuccess(false), 3000);
-    } catch (error) {
-      console.error("Error saving sorting schedule", error);
-      alert("Gagal menyimpan jadwal sortir.");
-    }
+    setFeedForm({
+      ...feedForm,
+      feed_entries: updatedEntries,
+      notes: entriesText,
+      quantity: 0
+    });
+  };
+
+  const removeFeedEntry = (index: number) => {
+    const updatedEntries = (feedForm.feed_entries || []).filter((_, i) => i !== index);
+    
+    // Format notes
+    const entriesText = updatedEntries.map(entry => 
+      `${entry.feed_type} = ${entry.quantity} sak`
+    ).join('\n');
+
+    setFeedForm({
+      ...feedForm,
+      feed_entries: updatedEntries,
+      notes: entriesText
+    });
   };
 
   const handleSaveFeed = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!feedForm.date || !feedForm.feed_type) return;
+    if (!user) return;
+    if (!feedForm.date) return;
 
     try {
-      await db.feed_data.add({
+      const feedToSave = {
+        uid: user.uid,
         date: feedForm.date,
-        feed_type: feedForm.feed_type,
+        feed_type: feedForm.feed_type || 'pf 500',
         quantity: Number(feedForm.quantity) || 0,
-        notes: feedForm.notes || ''
-      } as FeedData);
+        notes: feedForm.notes || '',
+        feed_entries: feedForm.feed_entries || [],
+        updatedAt: new Date().toISOString()
+      };
+
+      // If there are multiple entries, sum them up
+      if (feedForm.feed_entries && feedForm.feed_entries.length > 0) {
+        feedToSave.quantity = feedForm.feed_entries.reduce((sum, e) => sum + (Number(e.quantity) || 0), 0);
+        feedToSave.feed_type = feedForm.feed_entries.map(e => e.feed_type).join(', ');
+      }
+
+      if (editingFeed?.id) {
+        await updateDoc(doc(firestoreDb, 'feed_data', editingFeed.id), feedToSave as any);
+        setView('list'); // Go back to list after edit
+        setSelectedCommodity(null); // Return to main search result
+        setSearchQuery(''); // Reset search query
+        setShowAll(false); // Reset show all
+      } else {
+        await addDoc(collection(firestoreDb, 'feed_data'), feedToSave);
+      }
 
       setFeedForm({
-        date: new Date().toISOString().split('T')[0],
+        date: format(new Date(), 'yyyy-MM-dd'),
         feed_type: 'pf 500',
         quantity: 0,
-        notes: ''
+        notes: '',
+        feed_entries: []
       });
+      setEditingFeed(null);
       setShowFeedSuccess(true);
       setTimeout(() => setShowFeedSuccess(false), 3000);
     } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'feed_data');
       console.error("Error saving feed data", error);
-      alert("Gagal menyimpan data pakan.");
+      alert("Gagal menyimpan data pakan: " + (error instanceof Error ? error.message : String(error)));
+    }
+  };
+
+  const handleDeleteFeed = async (id: string | undefined) => {
+    if (!id) return;
+    try {
+      await deleteDoc(doc(firestoreDb, 'feed_data', id));
+      setDeleteConfirmId(null);
+      alert("Data pakan berhasil dihapus.");
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, 'feed_data');
+      console.error("Error deleting feed data", error);
+      alert("Gagal menghapus data pakan.");
     }
   };
 
   const handleSaveHarvest = async () => {
+    if (!user) return;
     if (!selectedCommodity) {
       alert('Mohon pilih komoditas');
       return;
@@ -473,39 +1008,98 @@ export default function App() {
     const commodity = commodities.find(c => c.id === selectedCommodity);
     
     try {
-      await db.harvests.add({
+      const harvestToSave = {
+        uid: user.uid,
         commodity_id: selectedCommodity,
         commodity_name: commodity?.name || '',
-        date: harvestForm.date || new Date().toISOString().split('T')[0],
+        date: harvestForm.date || format(new Date(), 'yyyy-MM-dd'),
         total_harvest: Number(harvestForm.total_harvest) || 0,
-        notes: harvestForm.notes || ''
-      });
+        notes: harvestForm.notes || '',
+        updatedAt: new Date().toISOString()
+      };
+
+      if (editingHarvest?.id) {
+        await updateDoc(doc(firestoreDb, 'harvests', editingHarvest.id), harvestToSave as any);
+        setView('list'); // Go back to list after edit
+        setSelectedCommodity(null); // Return to main search result
+        setSearchQuery(''); // Reset search query
+        setShowAll(false); // Reset show all
+      } else {
+        await addDoc(collection(firestoreDb, 'harvests'), harvestToSave);
+      }
 
       setShowHarvestSuccess(true);
       setTimeout(() => setShowHarvestSuccess(false), 2000);
       setHarvestForm({
-        date: new Date().toISOString().split('T')[0],
+        date: format(new Date(), 'yyyy-MM-dd'),
         total_harvest: 0,
         notes: ''
       });
+      setEditingHarvest(null);
     } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'harvests');
       console.error("Error saving harvest data", error);
       alert("Gagal menyimpan data panen.");
     }
   };
 
+  const handleDeleteHarvest = async (id: string | undefined) => {
+    if (!id) return;
+    try {
+      await deleteDoc(doc(firestoreDb, 'harvests', id));
+      setDeleteConfirmId(null);
+      alert("Data panen berhasil dihapus.");
+    } catch (error) {
+      handleFirestoreError(error, OperationType.DELETE, 'harvests');
+      console.error("Error deleting harvest data", error);
+      alert("Gagal menghapus data panen.");
+    }
+  };
+
   const handleEditReport = (report: ReportData) => {
+    console.log("Editing report:", report);
     setEditingReport(report);
-    setFormData({ ...report });
+    setFormData({ 
+      ...report,
+      keramba_entries: report.keramba_entries || [],
+      formSection: report.formSection || (report.supplier ? 'data_masuk' : 'klarifikasi_ukuran')
+    });
     
     // Set view based on report type
-    if (report.formSection === 'data_masuk') {
+    if (report.formSection === 'data_masuk' || (!report.formSection && report.supplier)) {
+      setFormSection('data_masuk');
       setView('bibit_list');
-    } else if (report.formSection === 'klarifikasi_ukuran') {
+    } else if (report.formSection === 'klarifikasi_ukuran' || (!report.formSection && report.code)) {
+      setFormSection('klarifikasi_ukuran');
       setView('keramba_list');
     }
     
     setIsFormExpanded(true);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleEditFeed = (feed: FeedData) => {
+    setEditingFeed(feed);
+    setFeedForm({
+      date: feed.date,
+      feed_type: feed.feed_type,
+      quantity: feed.quantity,
+      notes: feed.notes || '',
+      feed_entries: feed.feed_entries || []
+    });
+    setView('pakan_ikan');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleEditHarvest = (harvest: HarvestData) => {
+    setEditingHarvest(harvest);
+    setHarvestForm({
+      date: harvest.date,
+      total_harvest: harvest.total_harvest,
+      notes: harvest.notes || ''
+    });
+    setSelectedCommodity(harvest.commodity_id);
+    setView('panen');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -554,24 +1148,45 @@ export default function App() {
   };
 
   const filteredReports = reports.filter(r => {
-    const query = searchQuery.toLowerCase();
+    const query = searchQuery.toLowerCase().trim();
+    if (query === '') return true;
+
+    const words = query.split(/\s+/);
     
-    // Default search matches everything
-    let matchesSearch = 
-      r.commodity_name.toLowerCase().includes(query) ||
-      (r.date && r.date.toLowerCase().includes(query)) ||
-      (r.supplier && r.supplier.toLowerCase().includes(query)) ||
-      (r.harvest && r.harvest.toString().includes(query)) ||
-      (r.medium && r.medium.toString().includes(query)) ||
-      (r.small && r.small.toString().includes(query)) ||
-      (r.jumbo && r.jumbo.toString().includes(query)) ||
-      (r.code && r.code.toLowerCase().includes(query)) ||
-      (r.notes && r.notes.toLowerCase().includes(query)) ||
-      (r.sorting_date && r.sorting_date.toLowerCase().includes(query));
-    
+    // Check if each word matches something (AND logic)
+    const matchesAllWords = words.every(word => {
+      // Month check for this word
+      const monthNames = ['januari', 'februari', 'maret', 'april', 'mei', 'juni', 'juli', 'agustus', 'september', 'oktober', 'november', 'desember'];
+      const monthIndex = monthNames.findIndex(m => m.includes(word));
+      const isMonthNumber = /^\d{1,2}$/.test(word);
+      const queryMonthNum = isMonthNumber ? parseInt(word) : -1;
+      const isMonthKeyword = monthIndex !== -1 || (queryMonthNum >= 1 && queryMonthNum <= 12);
+      
+      const dateObj = r.date ? new Date(r.date) : null;
+      const rMonth = dateObj && !isNaN(dateObj.getTime()) ? dateObj.getMonth() : -1;
+
+      const matchesMonth = (monthIndex !== -1 && rMonth === monthIndex) ||
+                           (queryMonthNum >= 1 && queryMonthNum <= 12 && (rMonth + 1) === queryMonthNum);
+
+      // If it's a month keyword, it MUST match the entry date month
+      if (isMonthKeyword) return matchesMonth;
+
+      const matchesFields = 
+        (r.commodity_name && r.commodity_name.toLowerCase().includes(word)) ||
+        (r.date && r.date.toLowerCase().includes(word)) ||
+        (r.supplier && r.supplier.toLowerCase().includes(word)) ||
+        (r.harvest && r.harvest.toString().includes(word)) ||
+        (r.medium && r.medium.toString().includes(word)) ||
+        (r.small && r.small.toString().includes(word)) ||
+        (r.jumbo && r.jumbo.toString().includes(word)) ||
+        (r.code && r.code.toLowerCase().includes(word)) ||
+        (r.notes && r.notes.toLowerCase().includes(word));
+
+      return matchesFields;
+    });
+
     const matchesCommodity = selectedCommodity ? r.commodity_id === selectedCommodity : true;
     
-    // If we are in a specific section mode, only show reports that have data in that section
     let matchesSection = true;
     if (selectedCommodity || view === 'list' || view === 'bibit_list' || view === 'keramba_list') {
       let section = formSection;
@@ -579,25 +1194,58 @@ export default function App() {
       if (view === 'keramba_list') section = 'klarifikasi_ukuran';
 
       if (r.formSection) {
-        matchesSection = section === 'all' || r.formSection === section;
+        if (view === 'list' && section === 'all') {
+          // If searching, show everything. If not searching, hide keramba in 'all' tab
+          matchesSection = searchQuery.trim() !== '' || r.formSection !== 'klarifikasi_ukuran';
+        } else {
+          matchesSection = section === 'all' || r.formSection === section;
+        }
       } else {
         // Fallback for old data
         if (section === 'data_masuk') matchesSection = !!r.supplier || !!r.quantity;
-        if (section === 'klarifikasi_ukuran') matchesSection = !!r.harvest || !!r.medium || !!r.small || !!r.jumbo || !!r.code;
+        else if (section === 'klarifikasi_ukuran') matchesSection = !!r.harvest || !!r.medium || !!r.small || !!r.jumbo || !!r.code;
+        else if (view === 'list' && section === 'all') {
+          const isKeramba = !!r.harvest || !!r.medium || !!r.small || !!r.jumbo || !!r.code;
+          matchesSection = searchQuery.trim() !== '' || !isKeramba;
+        }
       }
     }
 
-    return matchesSearch && matchesCommodity && matchesSection;
+    return matchesAllWords && matchesCommodity && matchesSection;
   });
 
   const filteredFeedData = feedData.filter(f => {
-    const query = searchQuery.toLowerCase();
-    return (
-      f.date.toLowerCase().includes(query) ||
-      f.feed_type.toLowerCase().includes(query) ||
-      (f.notes && f.notes.toLowerCase().includes(query)) ||
-      f.quantity.toString().includes(query)
-    );
+    const query = searchQuery.toLowerCase().trim();
+    if (query === '') return true;
+    
+    const words = query.split(/\s+/);
+    
+    // Check if each word matches something (AND logic)
+    return words.every(word => {
+      // Month check for this word
+      const monthNames = ['januari', 'februari', 'maret', 'april', 'mei', 'juni', 'juli', 'agustus', 'september', 'oktober', 'november', 'desember'];
+      const monthIndex = monthNames.findIndex(m => m.includes(word));
+      const isMonthNumber = /^\d{1,2}$/.test(word);
+      const queryMonthNum = isMonthNumber ? parseInt(word) : -1;
+      const isMonthKeyword = monthIndex !== -1 || (queryMonthNum >= 1 && queryMonthNum <= 12);
+
+      const dateObj = f.date ? new Date(f.date) : null;
+      const fMonth = dateObj && !isNaN(dateObj.getTime()) ? dateObj.getMonth() : -1;
+
+      const matchesMonth = (monthIndex !== -1 && fMonth === monthIndex) ||
+                           (queryMonthNum >= 1 && queryMonthNum <= 12 && (fMonth + 1) === queryMonthNum);
+
+      // If it's a month keyword, it MUST match the entry date month
+      if (isMonthKeyword) return matchesMonth;
+
+      const matchesFields = 
+        f.date.toLowerCase().includes(word) ||
+        f.feed_type.toLowerCase().includes(word) ||
+        (f.notes && f.notes.toLowerCase().includes(word)) ||
+        f.quantity.toString().includes(word);
+
+      return matchesFields;
+    });
   });
 
   const [logoError, setLogoError] = useState(false);
@@ -609,11 +1257,32 @@ export default function App() {
     backgroundPosition: 'center',
   };
 
+  if (!isAuthReady) {
+    return (
+      <div className="min-h-screen bg-emerald-900 flex items-center justify-center">
+        <div className="text-center">
+          <div className="w-16 h-16 border-4 border-emerald-400 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
+          <p className="text-emerald-100 font-medium">Memuat aplikasi...</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen font-sans text-slate-900 relative">
       {/* Background with Overlay */}
       <div className="fixed inset-0 -z-10" style={bgStyle} />
       <div className="fixed inset-0 -z-10 bg-emerald-900/40 backdrop-blur-[2px]" />
+
+      {dbError && (
+        <div className="fixed top-4 left-4 right-4 z-[1000] bg-rose-600 text-white p-4 rounded-2xl shadow-2xl flex items-center gap-3 animate-in slide-in-from-top-4">
+          <AlertCircle size={24} />
+          <p className="text-sm font-bold">{dbError}</p>
+          <button onClick={() => setDbError(null)} className="ml-auto">
+            <X size={20} />
+          </button>
+        </div>
+      )}
 
       {/* Delete Confirmation Modal - Moved to Root */}
       {deleteConfirmId !== null && (
@@ -623,14 +1292,16 @@ export default function App() {
               <div className="w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center mx-auto mb-2">
                 <Trash2 size={32} />
               </div>
-              <h3 className="font-bold text-xl text-slate-900">Hapus Laporan?</h3>
+              <h3 className="font-bold text-xl text-slate-900">Hapus Data?</h3>
               <p className="text-slate-500">Data ini akan dihapus permanen dari sistem.</p>
             </div>
             <div className="flex flex-col gap-3">
               <button 
                 className="w-full py-4 bg-rose-600 text-white font-bold rounded-2xl active:scale-95 transition-transform shadow-lg shadow-rose-200"
                 onClick={() => {
-                  handleDeleteReport(deleteConfirmId);
+                  if (deleteType === 'report') handleDeleteReport(deleteConfirmId);
+                  else if (deleteType === 'feed') handleDeleteFeed(deleteConfirmId);
+                  else if (deleteType === 'harvest') handleDeleteHarvest(deleteConfirmId);
                 }}
               >
                 YA, HAPUS SEKARANG
@@ -647,54 +1318,184 @@ export default function App() {
       )}
 
       {/* Main Content */}
-      <div className="max-w-md mx-auto min-h-[100dvh] flex flex-col relative z-10 overflow-x-hidden">
+      <div className={cn(
+        "min-h-[100dvh] flex flex-col md:flex-row relative z-10 overflow-x-hidden",
+        user ? "" : "max-w-md mx-auto"
+      )}>
         
-        {/* Header */}
-        <header className="p-4 md:p-6 flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-3">
-            {(view === 'login' || (view === 'home' && !isLoggedIn)) && (
-              <div className="w-24 h-24 rounded-xl overflow-hidden border-2 border-white/50 shadow-lg bg-white flex items-center justify-center p-1">
-                {!logoError ? (
-                  <img 
-                    src={APP_LOGO_URL} 
-                    alt="TambakReport Logo" 
-                    className="w-full h-full object-contain"
-                    referrerPolicy="no-referrer"
-                    onError={() => setLogoError(true)}
-                  />
-                ) : (
-                  <User size={40} className="text-emerald-500" />
+        {/* Sidebar Navigation */}
+        {user && (
+          <aside className={cn(
+            "fixed md:sticky top-0 left-0 h-screen bg-emerald-950/80 backdrop-blur-md border-r border-white/10 z-[60] transition-all duration-300 ease-in-out",
+            "w-72 md:w-64",
+            isSidebarOpen ? "translate-x-0 shadow-2xl" : "-translate-x-full md:translate-x-0"
+          )}>
+            <div className="p-6 flex items-center justify-between border-b border-white/5">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-emerald-600 rounded-xl flex items-center justify-center text-white shadow-lg shadow-emerald-200/20 overflow-hidden">
+                  {user.photoURL ? (
+                    <img src={user.photoURL} alt="Profile" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  ) : (
+                    <Anchor size={24} />
+                  )}
+                </div>
+                <div className="flex flex-col">
+                  <span className="font-black text-white tracking-tight text-xl uppercase leading-tight">{user.displayName || 'User'}</span>
+                  <span className="text-[10px] text-emerald-400/60 font-bold uppercase tracking-widest">hallo, selamat bekerja</span>
+                </div>
+              </div>
+              <button 
+                onClick={() => setIsSidebarOpen(false)}
+                className="md:hidden p-2 text-white/40 hover:bg-white/5 rounded-lg"
+              >
+                <X size={24} />
+              </button>
+            </div>
+            
+            <nav className="flex-1 px-4 py-6 space-y-2 overflow-y-auto no-scrollbar">
+              <button 
+                onClick={() => { setView('home'); setIsSidebarOpen(false); }}
+                className={cn(
+                  "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all duration-300 font-bold text-sm uppercase tracking-wider", 
+                  view === 'home' ? "text-emerald-400 bg-white/5 shadow-sm" : "text-white/40 hover:bg-white/5 hover:text-white/70"
                 )}
+              >
+                <FileText size={20} />
+                <span>Home</span>
+              </button>
+              
+              <button 
+                onClick={() => { setView('stats'); setIsSidebarOpen(false); }}
+                className={cn(
+                  "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all duration-300 font-bold text-sm uppercase tracking-wider", 
+                  view === 'stats' ? "text-emerald-400 bg-white/5 shadow-sm" : "text-white/40 hover:bg-white/5 hover:text-white/70"
+                )}
+              >
+                <BarChart3 size={20} />
+                <span>Grafik</span>
+              </button>
+              
+              <button 
+                onClick={() => { setView('reminders'); setIsSidebarOpen(false); }}
+                className={cn(
+                  "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all duration-300 font-bold text-sm uppercase tracking-wider", 
+                  view === 'reminders' ? "text-emerald-400 bg-white/5 shadow-sm" : "text-white/40 hover:bg-white/5 hover:text-white/70"
+                )}
+              >
+                <Calendar size={20} />
+                <span>Jadwal</span>
+              </button>
+              
+              <button 
+                onClick={() => { setView('panen'); setIsSidebarOpen(false); }}
+                className={cn(
+                  "w-full flex items-center gap-4 px-4 py-3.5 rounded-2xl transition-all duration-300 font-bold text-sm uppercase tracking-wider", 
+                  view === 'panen' ? "text-emerald-400 bg-white/5 shadow-sm" : "text-white/40 hover:bg-white/5 hover:text-white/70"
+                )}
+              >
+                <Anchor size={20} />
+                <span>Analisa</span>
+              </button>
+            </nav>
+
+            <div className="p-4 border-t border-white/5 md:hidden" />
+          </aside>
+        )}
+
+        {/* Mobile Sidebar Overlay */}
+        {user && isSidebarOpen && (
+          <div 
+            className="md:hidden fixed inset-0 bg-black/50 backdrop-blur-sm z-50"
+            onClick={() => setIsSidebarOpen(false)}
+          />
+        )}
+
+        <div className="flex-1 flex flex-col min-w-0">
+          {/* Header */}
+          <header className={cn(
+            "p-4 md:p-6 flex items-center justify-between shrink-0 bg-emerald-950/40 backdrop-blur-md border-b border-white/5 sticky top-0 z-40",
+            !user && "bg-transparent border-none"
+          )}>
+            <div className="flex items-center gap-3">
+              {user && (
+                <button 
+                  onClick={() => setIsSidebarOpen(true)}
+                  className="md:hidden p-2 text-white/70 hover:bg-white/5 rounded-xl"
+                >
+                  <Menu size={24} />
+                </button>
+              )}
+              {(view === 'login' || (view === 'home' && !user)) && (
+                <div className="w-24 h-24 rounded-xl overflow-hidden border-2 border-white/50 shadow-lg bg-white flex items-center justify-center p-1">
+                  {!logoError ? (
+                    <img 
+                      src={APP_LOGO_URL} 
+                      alt="TambakReport Logo" 
+                      className="w-full h-full object-contain"
+                      referrerPolicy="no-referrer"
+                      onError={() => setLogoError(true)}
+                    />
+                  ) : (
+                    <User size={40} className="text-emerald-500" />
+                  )}
+                </div>
+              )}
+              {user && (
+                <div className="flex items-center gap-2 md:hidden">
+                  <div className="w-8 h-8 bg-emerald-600 rounded-lg flex items-center justify-center text-white overflow-hidden">
+                    {user.photoURL ? (
+                      <img src={user.photoURL} alt="Profile" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                    ) : (
+                      <Anchor size={18} />
+                    )}
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="font-bold text-white tracking-tight uppercase leading-tight">{user.displayName || 'User'}</span>
+                    <span className="text-[8px] text-emerald-400/60 font-bold uppercase tracking-widest">hallo, selamat bekerja</span>
+                  </div>
+                </div>
+              )}
+            </div>
+            {user && (
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="text-right hidden sm:block">
+                    <p className="text-[10px] font-black text-white/40 uppercase tracking-widest">Selamat Datang</p>
+                    <p className="text-sm font-black text-white">{user.displayName || 'User'}</p>
+                    <p className="text-[8px] font-bold text-emerald-400/60 uppercase tracking-widest">hallo, selamat bekerja</p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button 
+                    onClick={() => {
+                      setSearchQuery('');
+                      setSelectedCommodity(null);
+                      setShowAll(true);
+                      setFormSection('all');
+                      setView('list');
+                    }}
+                    className="p-2.5 bg-white/5 hover:bg-white/10 text-emerald-400 rounded-xl transition-all border border-white/10 flex items-center justify-center"
+                    title="Cari Cepat"
+                  >
+                    <Search size={18} />
+                  </button>
+                  <button 
+                    onClick={() => signOut(auth)}
+                    className="flex items-center gap-2 px-3 md:px-4 py-2 rounded-xl bg-rose-500/10 text-rose-400 border border-rose-500/20 hover:bg-rose-500/20 transition-all font-bold text-[10px] md:text-xs uppercase tracking-widest"
+                  >
+                    <LogOut size={16} />
+                    <span className="hidden sm:inline">Logout</span>
+                  </button>
+                </div>
               </div>
             )}
-            <div>
-              <h1 className="text-xl font-bold text-white tracking-tight">
-                {isLoggedIn ? `Halo, ${loginData.name}` : 'TambakReport'}
-              </h1>
-              <p className="text-emerald-100 text-xs">
-                {isLoggedIn ? 'Selamat bekerja!' : 'Manajemen Laporan Petani'}
-              </p>
-            </div>
-          </div>
-          {isLoggedIn && (
-            <button 
-              onClick={() => {
-                setIsLoggedIn(false);
-                setLoginData({ name: '', password: '' });
-                setView('home');
-              }}
-              className="px-3 py-1.5 bg-white/10 backdrop-blur-md border border-white/20 rounded-lg text-[10px] font-bold uppercase tracking-wider text-emerald-100 hover:bg-white/20 transition-all"
-            >
-              Logout
-            </button>
-          )}
-        </header>
+          </header>
 
-        {/* View Switcher */}
-        <main className={cn(
-          "flex-1 px-4 flex flex-col min-h-0",
-          (!isLoggedIn || view === 'login' || view === 'register') ? "justify-center pb-10" : "pb-24"
-        )}>
+          {/* View Switcher */}
+          <main className={cn(
+            "flex-1 px-4 flex flex-col min-h-0",
+            (!user || view === 'login' || view === 'register') ? "justify-center pb-10" : "pb-10"
+          )}>
           {view === 'login' && (
             <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500 max-h-full overflow-y-auto no-scrollbar">
               <Card className="p-6 md:p-8">
@@ -709,45 +1510,66 @@ export default function App() {
                   <p className="text-slate-500">Silakan login untuk melanjutkan</p>
                 </div>
 
-                <div className="space-y-4">
+                <form onSubmit={handleEmailSignIn} className="space-y-4">
+                  {authError && (
+                    <div className="p-3 bg-rose-50 border border-rose-100 rounded-xl text-rose-600 text-xs font-medium text-center">
+                      {authError}
+                    </div>
+                  )}
                   <div>
-                    <label className="text-xs font-bold text-slate-500 uppercase">Nama</label>
+                    <label className="text-xs font-bold text-slate-500 uppercase">Email</label>
                     <input 
-                      type="text"
+                      type="email"
+                      required
                       className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500"
-                      placeholder="Masukkan nama"
-                      value={loginData.name}
-                      onChange={e => setLoginData({...loginData, name: e.target.value})}
+                      placeholder="Masukkan email"
+                      value={email}
+                      onChange={e => setEmail(e.target.value)}
                     />
                   </div>
                   <div>
                     <label className="text-xs font-bold text-slate-500 uppercase">Password</label>
                     <input 
                       type="password"
+                      required
                       className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500"
                       placeholder="Masukkan password"
-                      value={loginData.password}
-                      onChange={e => setLoginData({...loginData, password: e.target.value})}
+                      value={password}
+                      onChange={e => setPassword(e.target.value)}
                     />
                   </div>
 
+                  <Button type="submit" className="w-full py-4 mt-2" disabled={authLoading}>
+                    {authLoading ? "Memproses..." : "Login"}
+                  </Button>
+                </form>
+
+                <div className="relative my-6">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-slate-100"></div>
+                  </div>
+                  <div className="relative flex justify-center text-xs uppercase">
+                    <span className="bg-white px-2 text-slate-400">Atau</span>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
                   <Button 
-                    className="w-full py-4 mt-4" 
-                    onClick={() => {
-                      if (loginData.name && loginData.password) {
-                        setIsLoggedIn(true);
-                        setView('commodities');
-                      } else {
-                        alert("Harap isi Nama dan Password");
-                      }
-                    }}
+                    variant="ghost"
+                    className="w-full py-4 flex items-center justify-center gap-3 bg-white text-slate-700 border border-slate-200 hover:bg-slate-50" 
+                    onClick={handleGoogleSignIn}
+                    disabled={authLoading}
                   >
-                    Login
+                    <img src="https://www.google.com/favicon.ico" alt="Google" className="w-5 h-5" />
+                    {authLoading ? "Memproses..." : "Login dengan Google"}
                   </Button>
 
                   <div className="text-center pt-2">
                     <button 
-                      onClick={() => setView('register')}
+                      onClick={() => {
+                        setAuthError(null);
+                        setView('register');
+                      }}
                       className="text-xs text-slate-400 hover:text-emerald-600 transition-colors font-medium"
                     >
                       Belum punya akun? <span className="underline">Buat Akun</span>
@@ -768,54 +1590,65 @@ export default function App() {
                   >
                     <ChevronLeft size={24} />
                   </button>
-                  <h2 className="text-2xl font-bold text-slate-800">Daftar Akun</h2>
-                  <p className="text-slate-500">Buat akun baru untuk mengelola tambak</p>
+                  <h2 className="text-2xl font-bold text-slate-800">Buat Akun</h2>
+                  <p className="text-slate-500">Daftar untuk mulai mengelola tambak</p>
                 </div>
 
-                <div className="space-y-4">
+                <form onSubmit={handleEmailRegister} className="space-y-4">
+                  {authError && (
+                    <div className="p-3 bg-rose-50 border border-rose-100 rounded-xl text-rose-600 text-xs font-medium text-center">
+                      {authError}
+                    </div>
+                  )}
                   <div>
                     <label className="text-xs font-bold text-slate-500 uppercase">Nama Lengkap</label>
                     <input 
                       type="text"
+                      required
                       className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500"
-                      placeholder="Masukkan nama lengkap"
+                      placeholder="Masukkan nama Anda"
+                      value={displayName}
+                      onChange={e => setDisplayName(e.target.value)}
                     />
                   </div>
                   <div>
-                    <label className="text-xs font-bold text-slate-500 uppercase">Username</label>
+                    <label className="text-xs font-bold text-slate-500 uppercase">Email</label>
                     <input 
-                      type="text"
+                      type="email"
+                      required
                       className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500"
-                      placeholder="Buat username"
+                      placeholder="Masukkan email"
+                      value={email}
+                      onChange={e => setEmail(e.target.value)}
                     />
                   </div>
                   <div>
                     <label className="text-xs font-bold text-slate-500 uppercase">Password</label>
                     <input 
                       type="password"
+                      required
                       className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500"
-                      placeholder="Buat password"
+                      placeholder="Masukkan password"
+                      value={password}
+                      onChange={e => setPassword(e.target.value)}
                     />
                   </div>
 
-                  <Button 
-                    className="w-full py-4 mt-4" 
+                  <Button type="submit" className="w-full py-4 mt-2" disabled={authLoading}>
+                    {authLoading ? "Memproses..." : "Daftar Sekarang"}
+                  </Button>
+                </form>
+
+                <div className="text-center pt-6">
+                  <button 
                     onClick={() => {
-                      alert("Akun berhasil dibuat! Silakan login.");
+                      setAuthError(null);
                       setView('login');
                     }}
+                    className="text-xs text-slate-400 hover:text-emerald-600 transition-colors font-medium"
                   >
-                    Daftar Sekarang
-                  </Button>
-
-                  <div className="text-center pt-2">
-                    <button 
-                      onClick={() => setView('login')}
-                      className="text-xs text-slate-400 hover:text-emerald-600 transition-colors font-medium"
-                    >
-                      Sudah punya akun? <span className="underline">Login di sini</span>
-                    </button>
-                  </div>
+                    Sudah punya akun? <span className="underline">Login di sini</span>
+                  </button>
                 </div>
               </Card>
             </div>
@@ -824,13 +1657,16 @@ export default function App() {
           {view === 'home' && (
             <div className={cn(
               "space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500",
-              !isLoggedIn && "flex flex-col justify-center"
+              !user && "flex flex-col justify-center"
             )}>
               {/* Due Date Notification Banner */}
-              {isLoggedIn && reports.some(r => {
+              {user && reports.some(r => {
                 if (r.formSection !== 'klarifikasi_ukuran') return false;
-                const today = new Date().toISOString().split('T')[0];
-                return r.sorting_date === today;
+                const today = format(new Date(), 'yyyy-MM-dd');
+                // Only show if it matches today AND hasn't been filled with data yet
+                const isToday = r.sorting_date === today;
+                const isNotDone = (r.harvest === 0 && r.medium === 0 && r.small === 0 && r.jumbo === 0);
+                return isToday && isNotDone;
               }) && (
                 <div className="mx-6 mt-4 p-4 bg-amber-500 text-white rounded-2xl shadow-lg flex items-center gap-3 animate-bounce duration-1000">
                   <Bell size={24} className="shrink-0" />
@@ -849,7 +1685,7 @@ export default function App() {
               )}
 
               {/* Landing Page / Dashboard */}
-              {!isLoggedIn ? (
+              {!user ? (
                 <div className="space-y-6 py-4">
                   <div className="text-center space-y-1">
                     <h2 className="text-2xl font-bold text-white drop-shadow-md">Selamat Datang</h2>
@@ -860,9 +1696,6 @@ export default function App() {
                     className="p-6 bg-white/10 backdrop-blur-xl border-white/20 text-white shadow-2xl transition-all group"
                   >
                     <div className="flex flex-col items-center gap-4 text-center">
-                      <div className="w-32 h-32 md:w-40 md:h-40 bg-white rounded-full flex items-center justify-center border-4 border-emerald-400/30 group-hover:bg-white/90 transition-all relative overflow-hidden shadow-2xl p-2 group-hover:scale-105 duration-300">
-                        <LoginUserIcon size={80} className="text-emerald-600" />
-                      </div>
                       <div>
                         <h2 className="text-xl font-bold">Login Pengguna</h2>
                         <p className="text-emerald-200 text-xs mt-1">Ketuk tombol di bawah untuk masuk</p>
@@ -886,75 +1719,60 @@ export default function App() {
                   </Card>
                 </div>
               ) : (
-                <div className="space-y-6">
+                <div className="space-y-6 px-4 pt-10 md:pt-12">
+                  {/* Global Stats */}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="glass p-4 rounded-2xl border border-white/20 shadow-lg flex flex-col justify-between h-24">
+                      <p className="text-[10px] font-bold text-emerald-100 uppercase tracking-wider">Total Bibit (Global)</p>
+                      <p className="text-2xl font-black text-white">{globalTotalBibit.toLocaleString()} <span className="text-[10px] font-normal opacity-70">Ekor</span></p>
+                    </div>
+                    <div className="glass p-4 rounded-2xl border border-white/20 shadow-lg flex flex-col justify-between h-24">
+                      <p className="text-[10px] font-bold text-blue-100 uppercase tracking-wider">Total Pakan (Global)</p>
+                      <p className="text-2xl font-black text-white">{globalTotalPakan.toLocaleString()} <span className="text-[10px] font-normal opacity-70">Sak</span></p>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-1 gap-4">
                     <Card 
-                      className="p-6 flex items-center gap-4 cursor-pointer hover:bg-white/100 transition-all group"
+                      className="p-5 flex items-center gap-4 group relative overflow-hidden"
                       onClick={() => setView('commodities')}
                     >
-                      <div className="p-4 bg-emerald-100 text-emerald-600 rounded-2xl group-hover:scale-110 transition-transform">
-                        <FileText size={32} />
+                      <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/5 rounded-full -mr-16 -mt-16 group-hover:scale-150 transition-transform duration-500" />
+                      <div className="flex-1">
+                        <h3 className="text-lg font-bold text-slate-800 tracking-tight">Pilih Komoditas</h3>
+                        <p className="text-xs font-medium text-slate-500">Mulai buat laporan baru</p>
                       </div>
-                      <div>
-                        <h3 className="text-lg font-bold text-slate-800">Pilih Komoditas</h3>
-                        <p className="text-sm text-slate-500">Mulai buat laporan baru</p>
-                      </div>
-                      <ChevronLeft className="rotate-180 ml-auto text-slate-300" size={24} />
+                      <ChevronLeft className="rotate-180 text-slate-300 group-hover:translate-x-1 transition-transform" size={24} />
                     </Card>
 
                     <Card 
-                      className="p-6 flex items-center gap-4 cursor-pointer hover:bg-white/100 transition-all group"
-                      onClick={() => {
-                        setFormSection('klarifikasi_ukuran');
-                        setSearchQuery('');
-                        setFormData({
-                          ...formData,
-                          sorting_date: new Date().toISOString().split('T')[0],
-                          harvest: 0,
-                          medium: 0,
-                          small: 0,
-                          jumbo: 0,
-                          code: '',
-                          notes: '',
-                          commodity_id: selectedCommodity || undefined,
-                          formSection: 'klarifikasi_ukuran'
-                        });
-                        setIsFormExpanded(true);
-                        setIsFeedFormExpanded(false);
-                        setView('keramba_list');
-                      }}
-                    >
-                      <div className="p-4 bg-emerald-100 text-emerald-600 rounded-2xl group-hover:scale-110 transition-transform">
-                        <Settings size={32} />
-                      </div>
-                      <div className="flex-1">
-                        <h3 className="text-lg font-bold text-slate-800">Data Keramba / Kolam</h3>
-                        <p className="text-sm text-slate-500">Input & Cari Kode Kolam</p>
-                      </div>
-                      <ChevronLeft className="rotate-180 text-slate-300" size={24} />
-                    </Card>
-                    <Card 
-                      className="p-6 flex items-center gap-4 cursor-pointer hover:bg-white/100 transition-all group"
+                      className="p-5 flex items-center gap-4 group relative overflow-hidden"
                       onClick={() => {
                         setView('pakan_ikan');
                         setFeedForm({
-                          date: new Date().toISOString().split('T')[0],
+                          date: format(new Date(), 'yyyy-MM-dd'),
                           feed_type: 'pf 500',
                           quantity: 0,
                           notes: ''
                         });
                       }}
                     >
-                      <div className="p-4 bg-emerald-100 text-emerald-600 rounded-2xl group-hover:scale-110 transition-transform">
-                        <Bell size={32} />
-                      </div>
+                      <div className="absolute top-0 right-0 w-32 h-32 bg-amber-500/5 rounded-full -mr-16 -mt-16 group-hover:scale-150 transition-transform duration-500" />
                       <div className="flex-1">
-                        <h3 className="text-lg font-bold text-slate-800">Pakan Ikan</h3>
-                        <p className="text-sm text-slate-500">Input Data Pakan</p>
+                        <h3 className="text-lg font-bold text-slate-800 tracking-tight">Pakan Ikan</h3>
+                        <p className="text-xs font-medium text-slate-500">Input Data Pakan</p>
                       </div>
-                      <ChevronLeft className="rotate-180 text-slate-300" size={24} />
+                      <ChevronRight className="text-slate-300 group-hover:translate-x-1 transition-transform" size={24} />
                     </Card>
 
+                    <div className="pt-4 flex justify-center gap-4">
+                      <button 
+                        onClick={() => window.location.reload()}
+                        className="px-4 py-2 rounded-xl glass text-[10px] text-slate-500 hover:text-emerald-600 transition-all font-bold uppercase tracking-widest flex items-center gap-2 shadow-sm border border-white/40 active:scale-95"
+                      >
+                        <RefreshCw size={12} className="animate-spin-slow" /> Refresh App
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -962,155 +1780,81 @@ export default function App() {
           )}
 
           {view === 'commodities' && (
-            <div className="space-y-6 animate-in fade-in slide-in-from-right-4 duration-300">
-              <div className="flex items-center gap-3 mb-2">
-                <Button variant="ghost" onClick={() => setView('home')} className="p-2 text-white hover:bg-white/20">
-                  <ChevronLeft size={24} />
-                </Button>
-                <h2 className="text-2xl font-bold text-white">Pilih Komoditas</h2>
-              </div>
+            <div className="space-y-6 px-4 animate-in fade-in slide-in-from-right-4 duration-500">
+              <PageHeader 
+                title="Pilih Komoditas" 
+                onBack={() => setView('home')} 
+              />
 
-              <Card className="p-6">
-                <div className="grid grid-cols-1 gap-3">
-                  {commodities.map(c => (
-                    <button
-                      key={c.id}
-                      onClick={() => {
-                        setSelectedCommodity(c.id);
-                        setEditingReport(null);
-                        setFormData({
-                          date: new Date().toISOString().split('T')[0],
-                          sorting_date: new Date().toISOString().split('T')[0],
-                          quantity: 0,
-                          status: 'Sehat',
-                          size_category: '1 in',
-                          formSection: 'data_masuk'
-                        });
-                        setView('commodity_dashboard');
-                      }}
-                      className="flex items-center justify-between p-4 rounded-xl bg-emerald-50 border border-emerald-100 hover:bg-emerald-100 transition-all group"
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="font-medium text-emerald-900">{c.name}</span>
-                      </div>
-                      <ChevronLeft className="rotate-180 text-emerald-400 group-hover:translate-x-1 transition-transform" size={20} />
-                    </button>
-                  ))}
-                </div>
-              </Card>
-            </div>
-          )}
-
-          {view === 'search_landing' && (
-            <div className="space-y-8 animate-in fade-in zoom-in-95 duration-500 py-12">
-              <div className="text-center space-y-2">
-                <div className="w-20 h-20 bg-white/20 backdrop-blur-xl rounded-3xl flex items-center justify-center mx-auto mb-6 border border-white/30 shadow-2xl">
-                  <Search size={40} className="text-white" />
-                </div>
-                <h2 className="text-3xl font-black text-white tracking-tight">Cari Laporan</h2>
-                <p className="text-emerald-100/80 text-sm font-medium">Masukkan nama supplier atau jenis komoditas</p>
-              </div>
-
-              <div className="relative max-w-md mx-auto">
-                <Search className="absolute left-4 top-1/2 -translate-y-1/2 text-emerald-600" size={24} />
-                <input 
-                  type="text" 
-                  autoFocus
-                  placeholder="Input Tanggal"
-                  className="w-full pl-12 pr-4 py-5 bg-white rounded-2xl border-none focus:ring-4 focus:ring-emerald-500/30 shadow-2xl text-lg font-medium placeholder:text-slate-400"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      setFormSection('data_masuk');
-                      setView('list');
-                    }
-                  }}
-                />
-                <button 
-                  className="absolute right-4 top-1/2 -translate-y-1/2 px-2 py-1 bg-slate-100 rounded text-[10px] font-bold text-slate-400 border border-slate-200 hover:bg-emerald-500 hover:text-white hover:border-emerald-500 transition-all"
-                  onClick={() => {
-                    setFormSection('data_masuk');
-                    setView('list');
-                  }}
-                >
-                  ENTER
-                </button>
-              </div>
-
-              <div className="flex flex-col items-center gap-4 max-w-sm mx-auto">
-                <div className="flex flex-wrap justify-center gap-2 opacity-60">
-                  {['Lele', 'Nila', 'Patin', 'Bawal', 'Gurami'].map(tag => (
-                    <button 
-                      key={tag}
-                      onClick={() => {
-                        setSearchQuery(tag);
-                        setFormSection('data_masuk');
-                        setView('list');
-                      }}
-                      className="px-4 py-2 bg-white/10 backdrop-blur-md rounded-full text-xs font-bold text-white border border-white/10 hover:bg-white/20 transition-colors"
-                    >
-                      #{tag}
-                    </button>
-                  ))}
-                </div>
-                
-                <button 
-                  onClick={() => {
-                    setSearchQuery('');
-                    setShowAll(true);
-                    setFormSection('data_masuk');
-                    setView('list');
-                  }}
-                  className="w-full py-4 bg-white/20 backdrop-blur-md rounded-2xl text-xs font-bold text-white border border-white/20 hover:bg-white/30 transition-all flex items-center justify-center gap-2 shadow-lg"
-                >
-                  <Calendar size={16} />
-                  Tampilkan Seluruh Data Bibit
-                </button>
+              <div className="grid grid-cols-1 gap-3">
+                {uniqueCommodities.map(c => (
+                  <Card
+                    key={c.id}
+                    onClick={() => {
+                      setSelectedCommodity(c.id);
+                      setEditingReport(null);
+                      setFormData({
+                        date: format(new Date(), 'yyyy-MM-dd'),
+                        sorting_date: format(new Date(), 'yyyy-MM-dd'),
+                        quantity: 0,
+                        status: 'Sehat',
+                        size_category: '1 in',
+                        formSection: 'data_masuk'
+                      });
+                      setView('commodity_dashboard');
+                    }}
+                    className="p-5 flex items-center justify-between group"
+                  >
+                    <div className="flex items-center gap-4">
+                      <span className="text-lg font-bold text-slate-800 tracking-tight">{c.name}</span>
+                    </div>
+                    <ChevronLeft className="rotate-180 text-slate-300 group-hover:text-emerald-500 group-hover:translate-x-1 transition-all" size={24} />
+                  </Card>
+                ))}
               </div>
             </div>
           )}
+
 
           {view === 'commodity_dashboard' && (
-            <div className="space-y-6 animate-in fade-in slide-in-from-right-4 duration-300">
-              <div className="flex items-center gap-3 mb-2">
-                <Button variant="ghost" onClick={() => setView('commodities')} className="p-2 text-white hover:bg-white/20">
-                  <ChevronLeft size={24} />
-                </Button>
-                <h2 className="text-2xl font-bold text-white">
-                  Dashboard {commodities.find(c => c.id === selectedCommodity)?.name}
-                </h2>
-              </div>
+            <div className="space-y-6 px-4 animate-in fade-in slide-in-from-right-4 duration-500">
+              <PageHeader 
+                title={`Dashboard ${commodities.find(c => c.id === selectedCommodity)?.name}`}
+                onBack={() => setView('commodities')}
+              />
 
-              <div className="grid grid-cols-1 gap-4">
-                <Card 
-                  className="p-6 flex items-center gap-4 cursor-pointer hover:bg-emerald-50 transition-all group"
-                  onClick={() => {
-                    setFormSection('data_masuk');
-                    setSearchQuery('');
-                    setFormData({
-                      ...formData,
-                      date: new Date().toISOString().split('T')[0],
-                      quantity: 0,
-                      status: 'Sehat',
-                      size_category: '1 in',
-                      supplier: '',
-                      commodity_id: selectedCommodity || undefined,
-                      formSection: 'data_masuk'
-                    });
-                    setIsFormExpanded(false);
-                    setView('bibit_list');
-                  }}
-                >
-                  <div className="p-4 bg-blue-100 text-blue-600 rounded-2xl group-hover:scale-110 transition-transform">
-                    <FileText size={32} />
-                  </div>
-                  <div className="flex-1">
-                    <h3 className="text-lg font-bold text-slate-800">Data Bibit</h3>
-                    <p className="text-sm text-slate-500">Input & Cari Supplier</p>
-                  </div>
-                  <ChevronLeft className="rotate-180 text-slate-300" size={24} />
-                </Card>
+              {/* Summary Stats removed as per user request */}
+
+              <div className="space-y-3">
+                <h4 className="text-[10px] font-bold text-emerald-100 uppercase tracking-widest px-1">Menu Utama</h4>
+                <div className="grid grid-cols-1 gap-4">
+                  <Card 
+                    className="p-5 flex items-center gap-4 group relative overflow-hidden"
+                    onClick={() => {
+                      setFormSection('data_masuk');
+                      setSearchQuery('');
+                      setFormData({
+                        ...formData,
+                        date: format(new Date(), 'yyyy-MM-dd'),
+                        quantity: 0,
+                        status: 'Sehat',
+                        size_category: '1 in',
+                        supplier: '',
+                        commodity_id: selectedCommodity || '',
+                        formSection: 'data_masuk'
+                      });
+                      setIsFormExpanded(true);
+                      setView('bibit_list');
+                    }}
+                  >
+                    <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/5 rounded-full -mr-16 -mt-16 group-hover:scale-150 transition-transform duration-500" />
+                    <div className="flex-1">
+                      <h3 className="text-lg font-bold text-slate-800 tracking-tight">Data Bibit</h3>
+                      <p className="text-xs font-medium text-slate-500">Input & Cari Supplier</p>
+                    </div>
+                    <ChevronRight className="text-slate-300 group-hover:translate-x-1 transition-transform" size={24} />
+                  </Card>
+                </div>
               </div>
             </div>
           )}
@@ -1120,7 +1864,7 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <Button variant="ghost" onClick={() => {
                   if (view === 'list') {
-                    setView('search_landing');
+                    setView('home');
                   } else if (view === 'keramba_list') {
                     setView('home');
                   } else {
@@ -1147,7 +1891,6 @@ export default function App() {
                 <div className="flex p-1 bg-white/10 backdrop-blur-md rounded-xl border border-white/10">
                   {[
                     { id: 'data_masuk', label: 'Bibit' },
-                    { id: 'klarifikasi_ukuran', label: 'Keramba' },
                     { id: 'pakan_ikan', label: 'Pakan Ikan' }
                   ].map((tab) => (
                     <button
@@ -1167,19 +1910,16 @@ export default function App() {
               )}
 
               {/* Integrated Form Section */}
-              {(view === 'list' || view === 'bibit_list' || view === 'keramba_list') && (
+              {(view === 'bibit_list' || view === 'keramba_list') && (
                 <div className="animate-in slide-in-from-top-4 duration-500">
                   <form onSubmit={handleSaveReport} className="space-y-4">
-                    {(view === 'bibit_list' || (view === 'list' && formSection === 'data_masuk')) && (
+                    {view === 'bibit_list' && (
                       <Card className="p-0 border-emerald-200 shadow-lg overflow-hidden">
                         <div 
                           className="p-4 bg-emerald-50 flex items-center justify-between cursor-pointer hover:bg-emerald-100 transition-colors"
                           onClick={() => setIsFormExpanded(!isFormExpanded)}
                         >
                           <div className="flex items-center gap-3">
-                            <div className="p-2 bg-emerald-600 text-white rounded-lg">
-                              <FileText size={18} />
-                            </div>
                             <div>
                               <h3 className="font-bold text-emerald-900 text-sm">Input Data Bibit (Masuk)</h3>
                               <p className="text-[10px] text-emerald-600 font-medium">Klik untuk {isFormExpanded ? 'menutup' : 'membuka'} formulir</p>
@@ -1191,55 +1931,55 @@ export default function App() {
                         {isFormExpanded && (
                           <div className="p-6 space-y-4 animate-in slide-in-from-top-2 duration-300">
                             <div className="space-y-4">
-                              <div>
-                                <label className="text-xs font-bold text-slate-500 uppercase">Komoditas</label>
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Komoditas</label>
                                 <select 
                                   required
-                                  className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500" 
+                                  className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700 appearance-none" 
                                   value={formData.commodity_id || ''} 
-                                  onChange={e => setFormData({...formData, commodity_id: Number(e.target.value)})}
+                                  onChange={e => setFormData({...formData, commodity_id: e.target.value})}
                                 >
                                   <option value="">Pilih Komoditas</option>
-                                  {commodities.map(c => (
+                                  {uniqueCommodities.map(c => (
                                     <option key={c.id} value={c.id}>{c.name}</option>
                                   ))}
                                 </select>
                               </div>
-                              <div>
-                                <label className="text-xs font-bold text-slate-500 uppercase">Tanggal</label>
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Tanggal</label>
                                 <input 
                                   type="date" 
                                   required 
-                                  className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500" 
+                                  className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700" 
                                   value={formData.date} 
                                   onChange={e => setFormData({...formData, date: e.target.value})} 
                                 />
                               </div>
-                              <div>
-                                <label className="text-xs font-bold text-slate-500 uppercase">Supplier</label>
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Supplier</label>
                                 <input 
                                   type="text" 
                                   placeholder="Nama Supplier" 
-                                  className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500" 
+                                  className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700 placeholder:text-slate-300" 
                                   value={formData.supplier || ''} 
                                   onChange={e => setFormData({...formData, supplier: e.target.value})} 
                                 />
                               </div>
-                              <div className="grid grid-cols-2 gap-3">
-                                <div>
-                                  <label className="text-xs font-bold text-slate-500 uppercase">Jumlah (ekor)</label>
+                              <div className="grid grid-cols-2 gap-4">
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Jumlah (ekor)</label>
                                   <input 
                                     type="number" 
                                     required 
-                                    className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500" 
+                                    className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700" 
                                     value={formData.quantity} 
                                     onChange={e => setFormData({...formData, quantity: Number(e.target.value)})} 
                                   />
                                 </div>
-                                <div>
-                                  <label className="text-xs font-bold text-slate-500 uppercase">Status</label>
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Status</label>
                                   <select 
-                                    className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500" 
+                                    className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700 appearance-none" 
                                     value={formData.status} 
                                     onChange={e => setFormData({...formData, status: e.target.value})}
                                   >
@@ -1248,11 +1988,11 @@ export default function App() {
                                   </select>
                                 </div>
                               </div>
-                              <div className="grid grid-cols-2 gap-3">
-                                <div>
-                                  <label className="text-xs font-bold text-slate-500 uppercase">Ukuran</label>
+                              <div className="grid grid-cols-2 gap-4">
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Ukuran</label>
                                   <select 
-                                    className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500" 
+                                    className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700 appearance-none" 
                                     value={formData.size_category} 
                                     onChange={e => setFormData({...formData, size_category: e.target.value})}
                                   >
@@ -1267,36 +2007,76 @@ export default function App() {
                                     <option>4,6</option>
                                   </select>
                                 </div>
-                                <div>
-                                  <label className="text-xs font-bold text-slate-500 uppercase">Harga</label>
-                                  <input 
-                                    type="number" 
-                                    className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500" 
-                                    value={formData.price || 0} 
-                                    onChange={e => setFormData({...formData, price: Number(e.target.value)})} 
-                                  />
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Kode Kolam</label>
+                                  <select 
+                                    className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700 appearance-none" 
+                                    value={formData.code || ''} 
+                                    onChange={e => setFormData({...formData, code: e.target.value})}
+                                  >
+                                    <option value="">Pilih Kode</option>
+                                    {ALL_POND_CODES.filter(code => {
+                                      // If editing, allow the current code
+                                      const isCurrentCode = editingReport && (
+                                        editingReport.code === code || 
+                                        (editingReport.code && editingReport.code.split(',').map(c => c.trim()).includes(code))
+                                      );
+                                      if (isCurrentCode) return true;
+
+                                      // Filter out codes that already have ANY report
+                                      // If a pond is in any report, it's considered "occupied"
+                                      return !reports.some(r => 
+                                        r.code && 
+                                        r.code.split(',').map(c => c.trim()).includes(code)
+                                      );
+                                    }).map(code => (
+                                      <option key={code} value={code}>{code}</option>
+                                    ))}
+                                  </select>
                                 </div>
                               </div>
-                              <div>
-                                <label className="text-xs font-bold text-slate-500 uppercase">Catatan</label>
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Harga</label>
                                 <input 
-                                  type="text" 
-                                  className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500" 
-                                  value={formData.notes || ''} 
-                                  onChange={e => setFormData({...formData, notes: e.target.value})} 
+                                  type="number" 
+                                  className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700" 
+                                  value={formData.price || 0} 
+                                  onChange={e => setFormData({...formData, price: Number(e.target.value)})} 
+                                />
+                              </div>
+                              
+                              {formData.quantity && formData.price ? (
+                                <div className="p-4 bg-emerald-50 rounded-2xl border border-emerald-100 flex justify-between items-center shadow-inner">
+                                  <span className="text-[10px] font-black text-emerald-700 uppercase tracking-widest">Total Investasi</span>
+                                  <span className="text-xl font-black text-emerald-600">
+                                    Rp {(formData.quantity * formData.price).toLocaleString('id-ID')}
+                                  </span>
+                                </div>
+                              ) : null}
+
+                              <div className="space-y-1.5">
+                                <label className="text-[10px] font-black text-emerald-700 uppercase tracking-widest ml-1">Keterangan</label>
+                                <textarea 
+                                  placeholder="Tambahkan keterangan..."
+                                  rows={2}
+                                  className="w-full p-3.5 bg-white rounded-2xl border border-emerald-100 focus:ring-4 focus:ring-emerald-500/20 shadow-sm text-sm font-bold text-slate-700 placeholder:text-slate-300 resize-none" 
+                                  value={formData.description || ''} 
+                                  onChange={e => setFormData({...formData, description: e.target.value})} 
                                 />
                               </div>
                             </div>
-                            <div className="flex gap-2">
+                            <div className="flex gap-3">
                               {editingReport && (
                                 <Button 
                                   variant="secondary" 
-                                  className="flex-1 py-3 text-sm rounded-xl border-emerald-200 text-emerald-700"
+                                  className="flex-1 py-4 text-sm font-black rounded-2xl border-emerald-200 text-emerald-700 active:scale-95 transition-all"
                                   onClick={() => {
                                     setEditingReport(null);
+                                    setSearchQuery(''); // Reset search query
+                                    setShowAll(false); // Reset show all
                                     setFormData({
-                                      date: new Date().toISOString().split('T')[0],
-                                      sorting_date: new Date().toISOString().split('T')[0],
+                                      date: format(new Date(), 'yyyy-MM-dd'),
+                                      sorting_date: format(new Date(), 'yyyy-MM-dd'),
                                       quantity: 0,
                                       status: 'Sehat',
                                       size_category: '1 in',
@@ -1310,11 +2090,15 @@ export default function App() {
                                     });
                                   }}
                                 >
-                                  Batal Edit
+                                  Batal
                                 </Button>
                               )}
-                              <Button className="flex-[2] py-3 text-sm rounded-xl">
-                                {editingReport ? 'Update Data Bibit' : 'Simpan Data Bibit'}
+                              <Button 
+                                type="submit" 
+                                disabled={isSaving} 
+                                className="flex-[2] py-4 text-sm font-black bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl shadow-lg shadow-emerald-200 active:scale-95 transition-all"
+                              >
+                                {isSaving ? 'Menyimpan...' : (editingReport ? 'Update Data' : 'Simpan Data')}
                               </Button>
                             </div>
                           </div>
@@ -1322,7 +2106,7 @@ export default function App() {
                       </Card>
                     )}
 
-                    {(view === 'keramba_list' || (view === 'list' && formSection === 'klarifikasi_ukuran')) && (
+                    {view === 'keramba_list' && (
                       <div className="space-y-4">
                         <Card className="p-0 border-blue-200 shadow-lg overflow-hidden">
                           <div 
@@ -1330,9 +2114,6 @@ export default function App() {
                             onClick={() => setIsFormExpanded(!isFormExpanded)}
                           >
                             <div className="flex items-center gap-3">
-                              <div className="p-2 bg-blue-600 text-white rounded-lg">
-                                <Settings size={18} />
-                              </div>
                               <div>
                                 <h3 className="font-bold text-blue-900 text-sm">Input Data Keramba / Kolam</h3>
                                 <p className="text-[10px] text-blue-600 font-medium">Klik untuk {isFormExpanded ? 'menutup' : 'membuka'} formulir</p>
@@ -1343,65 +2124,175 @@ export default function App() {
 
                           {isFormExpanded && (
                             <div className="p-6 space-y-4 animate-in slide-in-from-top-2 duration-300">
-                              <div className="space-y-3">
-                                <div className="grid grid-cols-2 gap-3">
-                                  <div>
-                                    <label className="text-[10px] font-bold text-slate-500 uppercase">Tgl Sortir</label>
-                                    <input type="date" className="w-full p-2 bg-slate-50 rounded-lg border-none text-sm" value={formData.sorting_date || ''} onChange={e => setFormData({...formData, sorting_date: e.target.value})} />
+                              <div className="space-y-4">
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Komoditas</label>
+                                  <select 
+                                    required
+                                    className="w-full p-3.5 bg-white rounded-2xl border border-blue-100 focus:ring-4 focus:ring-blue-500/20 shadow-sm text-sm font-bold text-slate-700 appearance-none" 
+                                    value={formData.commodity_id || ''} 
+                                    onChange={e => setFormData({...formData, commodity_id: e.target.value})}
+                                  >
+                                    <option value="">Pilih Komoditas</option>
+                                    {uniqueCommodities.map(c => (
+                                      <option key={c.id} value={c.id}>{c.name}</option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                  <div className="space-y-1.5">
+                                    <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Tgl Sortir</label>
+                                    <input 
+                                      type="date" 
+                                      className="w-full p-3.5 bg-white rounded-2xl border border-blue-100 focus:ring-4 focus:ring-blue-500/20 shadow-sm text-sm font-bold text-slate-700" 
+                                      value={formData.sorting_date || ''} 
+                                      onChange={e => setFormData({...formData, sorting_date: e.target.value})} 
+                                    />
                                   </div>
-                                  <div>
-                                    <label className="text-[10px] font-bold text-slate-500 uppercase">Kode Kolam</label>
-                                    <select className="w-full p-2 bg-slate-50 rounded-lg border-none text-sm" value={formData.code || ''} onChange={e => setFormData({...formData, code: e.target.value})}>
+                                  <div className="space-y-1.5">
+                                    <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Kode Kolam</label>
+                                    <select 
+                                      className="w-full p-3.5 bg-white rounded-2xl border border-blue-100 focus:ring-4 focus:ring-blue-500/20 shadow-sm text-sm font-bold text-slate-700 appearance-none" 
+                                      value={formData.code || ''} 
+                                      onChange={e => setFormData({...formData, code: e.target.value})}
+                                    >
                                       <option value="">Pilih Kode</option>
-                                      {[
-                                        ...Array.from({ length: 50 }, (_, i) => `B.A${i + 1}`),
-                                        ...Array.from({ length: 30 }, (_, i) => `A${i + 1}`),
-                                        ...Array.from({ length: 8 }, (_, i) => `K.B${i + 1}`),
-                                        ...Array.from({ length: 4 }, (_, i) => `K.T${i + 1}`),
-                                      ].map(code => (
+                                      {ALL_POND_CODES.filter(code => {
+                                        // Filter out codes that already have a 'klarifikasi_ukuran' report in OTHER reports
+                                        const isUsedInOtherReports = reports.some(r => 
+                                          r.id !== editingReport?.id &&
+                                          r.formSection === 'klarifikasi_ukuran' && 
+                                          r.code && 
+                                          r.code.split(',').map(c => c.trim()).includes(code)
+                                        );
+
+                                        // Filter out codes that are already in the current entries list (to prevent adding same code twice in one report)
+                                        const isUsedInCurrentEntries = formData.keramba_entries?.some(e => e.code === code);
+                                        
+                                        return !isUsedInOtherReports && !isUsedInCurrentEntries;
+                                      }).map(code => (
                                         <option key={code} value={code}>{code}</option>
                                       ))}
                                     </select>
                                   </div>
                                 </div>
-                                <div className="grid grid-cols-4 gap-2">
-                                  <div>
-                                    <label className="text-[8px] font-bold text-slate-400 uppercase">Panen</label>
-                                    <input type="number" className="w-full p-1.5 bg-slate-50 rounded border border-slate-100 text-xs" value={formData.harvest || 0} onChange={e => setFormData({...formData, harvest: Number(e.target.value)})} />
-                                  </div>
-                                  <div>
-                                    <label className="text-[8px] font-bold text-slate-400 uppercase">Sedang</label>
-                                    <input type="number" className="w-full p-1.5 bg-slate-50 rounded border border-slate-100 text-xs" value={formData.medium || 0} onChange={e => setFormData({...formData, medium: Number(e.target.value)})} />
-                                  </div>
-                                  <div>
-                                    <label className="text-[8px] font-bold text-slate-400 uppercase">Kecil</label>
-                                    <input type="number" className="w-full p-1.5 bg-slate-50 rounded border border-slate-100 text-xs" value={formData.small || 0} onChange={e => setFormData({...formData, small: Number(e.target.value)})} />
-                                  </div>
-                                  <div>
-                                    <label className="text-[8px] font-bold text-slate-400 uppercase">Jumbo</label>
-                                    <input type="number" className="w-full p-1.5 bg-slate-50 rounded border border-slate-100 text-xs" value={formData.jumbo || 0} onChange={e => setFormData({...formData, jumbo: Number(e.target.value)})} />
-                                  </div>
+                                <div className="flex items-center justify-between mb-2">
+                                  <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Keterangan Ukuran (kg)</label>
+                                  <button 
+                                    type="button"
+                                    onClick={() => setIsKerambaSizeInfoExpanded(!isKerambaSizeInfoExpanded)}
+                                    className="p-1.5 bg-blue-100 text-blue-700 rounded-lg hover:bg-blue-200 transition-colors flex items-center gap-1.5 text-[10px] font-bold"
+                                  >
+                                    {isKerambaSizeInfoExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                                    <span>{isKerambaSizeInfoExpanded ? 'Minimize' : 'Expand'}</span>
+                                  </button>
                                 </div>
-                                <div>
-                                  <label className="text-[10px] font-bold text-slate-500 uppercase">Catatan</label>
+                                {isKerambaSizeInfoExpanded && (
+                                  <>
+                                    <div className="grid grid-cols-2 gap-4">
+                                      <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Panen (kg)</label>
+                                        <input 
+                                          type="number" 
+                                          className="w-full p-3.5 bg-white rounded-2xl border border-blue-100 focus:ring-4 focus:ring-blue-500/20 shadow-sm text-sm font-bold text-slate-700" 
+                                          value={formData.harvest || 0} 
+                                          onChange={e => setFormData({...formData, harvest: Number(e.target.value)})} 
+                                        />
+                                      </div>
+                                      <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Sedang (kg)</label>
+                                        <input 
+                                          type="number" 
+                                          className="w-full p-3.5 bg-white rounded-2xl border border-blue-100 focus:ring-4 focus:ring-blue-500/20 shadow-sm text-sm font-bold text-slate-700" 
+                                          value={formData.medium || 0} 
+                                          onChange={e => setFormData({...formData, medium: Number(e.target.value)})} 
+                                        />
+                                      </div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-4">
+                                      <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Kecil (kg)</label>
+                                        <input 
+                                          type="number" 
+                                          className="w-full p-3.5 bg-white rounded-2xl border border-blue-100 focus:ring-4 focus:ring-blue-500/20 shadow-sm text-sm font-bold text-slate-700" 
+                                          value={formData.small || 0} 
+                                          onChange={e => setFormData({...formData, small: Number(e.target.value)})} 
+                                        />
+                                      </div>
+                                      <div className="space-y-1.5">
+                                        <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Jumbo (kg)</label>
+                                        <input 
+                                          type="number" 
+                                          className="w-full p-3.5 bg-white rounded-2xl border border-blue-100 focus:ring-4 focus:ring-blue-500/20 shadow-sm text-sm font-bold text-slate-700" 
+                                          value={formData.jumbo || 0} 
+                                          onChange={e => setFormData({...formData, jumbo: Number(e.target.value)})} 
+                                        />
+                                      </div>
+                                    </div>
+                                  </>
+                                )}
+                                
+                                <Button 
+                                  onClick={addKerambaEntry}
+                                  className="w-full py-3 bg-blue-100 text-blue-700 hover:bg-blue-200 border border-blue-200 rounded-2xl text-xs font-black uppercase tracking-widest"
+                                >
+                                  <Plus size={16} /> Tambah Data Keramba
+                                </Button>
+
+                                {formData.keramba_entries && formData.keramba_entries.length > 0 && (
+                                  <div className="space-y-2">
+                                    <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Daftar Keramba</label>
+                                    <div className="space-y-2">
+                                      {formData.keramba_entries.map((entry, index) => (
+                                        <div key={index} className="flex items-center justify-between p-3 bg-white rounded-2xl border border-blue-100 shadow-sm">
+                                          <div className="flex flex-col">
+                                            <span className="text-sm font-black text-slate-700">{entry.code}</span>
+                                            <span className="text-[10px] text-slate-500 font-bold">
+                                              {[
+                                                entry.harvest > 0 && `P:${entry.harvest}kg`,
+                                                entry.medium > 0 && `S:${entry.medium}kg`,
+                                                entry.small > 0 && `K:${entry.small}kg`,
+                                                entry.jumbo > 0 && `J:${entry.jumbo}kg`
+                                              ].filter(Boolean).join(' | ')}
+                                            </span>
+                                          </div>
+                                          <button 
+                                            type="button"
+                                            onClick={() => removeKerambaEntry(index)}
+                                            className="p-2 text-rose-500 hover:bg-rose-50 rounded-xl transition-colors"
+                                          >
+                                            <Trash2 size={16} />
+                                          </button>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                                
+
+                                <div className="space-y-1.5">
+                                  <label className="text-[10px] font-black text-blue-700 uppercase tracking-widest ml-1">Catatan</label>
                                   <textarea 
-                                    className="w-full p-2 bg-slate-50 rounded-lg border-none text-sm" 
+                                    placeholder="Tambahkan catatan..."
+                                    className="w-full p-3.5 bg-white rounded-2xl border border-blue-100 focus:ring-4 focus:ring-blue-500/20 shadow-sm text-sm font-bold text-slate-700 placeholder:text-slate-300" 
                                     rows={2} 
                                     value={formData.notes || ''} 
                                     onChange={e => setFormData({...formData, notes: e.target.value})} 
                                   />
                                 </div>
                               </div>
-                              <div className="flex gap-2">
+                              <div className="flex gap-3">
                                 {editingReport && (
                                   <Button 
                                     variant="secondary" 
-                                    className="flex-1 py-2 text-sm border-blue-200 text-blue-700"
+                                    className="flex-1 py-4 text-sm font-black rounded-2xl border-blue-200 text-blue-700 active:scale-95 transition-all"
                                     onClick={() => {
                                       setEditingReport(null);
+                                      setSearchQuery(''); // Reset search query
+                                      setShowAll(false); // Reset show all
                                       setFormData({
-                                        date: new Date().toISOString().split('T')[0],
-                                        sorting_date: new Date().toISOString().split('T')[0],
+                                        date: format(new Date(), 'yyyy-MM-dd'),
+                                        sorting_date: format(new Date(), 'yyyy-MM-dd'),
                                         quantity: 0,
                                         status: 'Sehat',
                                         size_category: '1 in',
@@ -1415,14 +2306,16 @@ export default function App() {
                                       });
                                     }}
                                   >
-                                    Batal Edit
+                                    Batal
                                   </Button>
                                 )}
                                 <Button 
-                                  className="flex-[2] py-2 text-sm bg-blue-600 hover:bg-blue-500"
-                                  onClick={handleSaveReport}
+                                  type="submit"
+                                  ref={submitButtonRef}
+                                  disabled={isSaving}
+                                  className="flex-[2] py-4 text-sm font-black bg-blue-600 hover:bg-blue-500 text-white rounded-2xl shadow-lg shadow-blue-200 active:scale-95 transition-all"
                                 >
-                                  {editingReport ? 'Update Data Keramba' : 'Simpan Data Keramba'}
+                                  {isSaving ? 'Menyimpan...' : (editingReport ? 'Update Data' : 'Simpan Data')}
                                 </Button>
                               </div>
                             </div>
@@ -1430,87 +2323,7 @@ export default function App() {
                         </Card>
                       </div>
                     )}
-                    {view === 'list' && formSection === 'pakan_ikan' && (
-                      <div className="animate-in slide-in-from-top-4 duration-500">
-                        <Card className="p-0 border-orange-200 shadow-lg overflow-hidden">
-                          <div 
-                            className="p-4 bg-orange-50 flex items-center justify-between cursor-pointer hover:bg-orange-100 transition-colors"
-                            onClick={() => setIsFormExpanded(!isFormExpanded)}
-                          >
-                            <div className="flex items-center gap-3">
-                              <div className="p-2 bg-orange-600 text-white rounded-lg">
-                                <Zap size={18} />
-                              </div>
-                              <div>
-                                <h3 className="font-bold text-orange-900 text-sm">Input Data Pakan Ikan</h3>
-                                <p className="text-[10px] text-orange-600 font-medium">Klik untuk {isFormExpanded ? 'menutup' : 'membuka'} formulir</p>
-                              </div>
-                            </div>
-                            {isFormExpanded ? <ChevronUp size={20} className="text-orange-600" /> : <ChevronDown size={20} className="text-orange-600" />}
-                          </div>
-
-                          {isFormExpanded && (
-                            <div className="p-6 space-y-4 animate-in slide-in-from-top-2 duration-300">
-                              <div className="space-y-3">
-                                <div>
-                                  <label className="text-[10px] font-bold text-slate-500 uppercase">Tgl</label>
-                                  <input 
-                                    type="date" 
-                                    className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-orange-500" 
-                                    value={feedForm.date || ''} 
-                                    onChange={e => setFeedForm({...feedForm, date: e.target.value})} 
-                                  />
-                                </div>
-                                <div>
-                                  <label className="text-[10px] font-bold text-slate-500 uppercase">Jenis Pakan</label>
-                                  <select 
-                                    className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-orange-500" 
-                                    value={feedForm.feed_type || ''} 
-                                    onChange={e => setFeedForm({...feedForm, feed_type: e.target.value})}
-                                  >
-                                    <option value="pf 500">pf 500</option>
-                                    <option value="pf 800">pf 800</option>
-                                    <option value="pf 1000">pf 1000</option>
-                                    <option value="-1">-1</option>
-                                    <option value="-2">-2</option>
-                                  </select>
-                                </div>
-                                <div>
-                                  <label className="text-[10px] font-bold text-slate-500 uppercase">Jumlah (Sak)</label>
-                                  <input 
-                                    type="number" 
-                                    className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-orange-500" 
-                                    value={feedForm.quantity || 0} 
-                                    onChange={e => setFeedForm({...feedForm, quantity: Number(e.target.value)})} 
-                                  />
-                                </div>
-                                <div>
-                                  <label className="text-[10px] font-bold text-slate-500 uppercase">Catatan</label>
-                                  <textarea 
-                                    className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-orange-500" 
-                                    rows={3} 
-                                    value={feedForm.notes || ''} 
-                                    onChange={e => setFeedForm({...feedForm, notes: e.target.value})} 
-                                  />
-                                </div>
-                              </div>
-                              <Button 
-                                onClick={(e) => {
-                                  e.preventDefault();
-                                  handleSaveFeed(e as any);
-                                }}
-                                className="w-full py-3 bg-orange-600 hover:bg-orange-500 text-white font-bold rounded-xl shadow-lg"
-                              >
-                                Simpan Data Pakan
-                              </Button>
-                              {showFeedSuccess && (
-                                <p className="text-sm text-emerald-600 font-bold text-center animate-bounce">Data Pakan berhasil disimpan!</p>
-                              )}
-                            </div>
-                          )}
-                        </Card>
-                      </div>
-                    )}
+                    {/* Pakan form removed from search results page */}
                   </form>
                 </div>
               )}
@@ -1520,7 +2333,7 @@ export default function App() {
                   <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
                   <input 
                     type="text" 
-                    placeholder={view === 'bibit_list' ? "input bulan" : "Input Tanggal"}
+                    placeholder={view === 'bibit_list' ? "Cari Bulan (Contoh: 03 atau Maret)" : "Cari Data..."}
                     className="w-full pl-10 pr-16 py-3 bg-white/90 backdrop-blur-md rounded-xl border-none focus:ring-2 focus:ring-emerald-500 shadow-sm"
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
@@ -1533,7 +2346,7 @@ export default function App() {
                   <button 
                     className="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-1 bg-slate-100 rounded text-[10px] font-bold text-slate-400 border border-slate-200 hover:bg-emerald-500 hover:text-white hover:border-emerald-500 transition-all"
                     onClick={() => {
-                      const input = document.querySelector('input[placeholder="Input Tanggal"], input[placeholder="input bulan"]') as HTMLInputElement;
+                      const input = document.querySelector('input[placeholder="Cari Bulan (Contoh: 03 atau Maret)"], input[placeholder="Cari Data..."]') as HTMLInputElement;
                       if (input) input.blur();
                     }}
                   >
@@ -1570,8 +2383,9 @@ export default function App() {
                   className="flex overflow-x-auto snap-x snap-mandatory scroll-smooth gap-4 pb-6 no-scrollbar"
                 >
                   {formSection === 'pakan_ikan' ? (
-                    filteredFeedData.length > 0 ? (
-                      filteredFeedData.map(feed => (
+                    (searchQuery.trim() !== '' || showAll) ? (
+                      filteredFeedData.length > 0 ? (
+                        filteredFeedData.map(feed => (
                         <div key={feed.id || Math.random()} className="min-w-full snap-center px-1">
                           <Card className="p-4 overflow-hidden shadow-xl border-white/20 bg-white/95 backdrop-blur-sm">
                             <div className="flex justify-between items-start mb-3">
@@ -1599,24 +2413,37 @@ export default function App() {
                                 {feed.notes && (
                                   <>
                                     <div className="text-slate-500">Catatan:</div>
-                                    <div className="font-medium text-right text-[10px] italic text-slate-600">{feed.notes}</div>
+                                    <div className="font-medium text-right text-[10px] italic text-slate-600 whitespace-pre-wrap">{feed.notes}</div>
                                   </>
                                 )}
                               </div>
+                              {feed.updatedAt && (
+                                <p className="text-[8px] text-slate-400 mt-2 italic text-right">
+                                  Data terakhir di update: {format(new Date(feed.updatedAt), 'dd MMM yyyy HH:mm')}
+                                </p>
+                              )}
                             </div>
 
                             <div className="flex flex-wrap gap-2 border-t border-slate-100 pt-3 relative z-10">
                               <Button 
+                                variant="ghost" 
+                                className="flex-1 text-[11px] h-10 px-2" 
+                                onClick={() => handleEditFeed(feed)}
+                              >
+                                <Edit size={14} /> Edit
+                              </Button>
+                              <Button 
                                 variant="danger" 
                                 className="flex-1 text-[11px] h-10 px-2" 
-                                onClick={async (e) => {
+                                onClick={(e) => {
                                   e.stopPropagation();
-                                  if (feed.id && window.confirm("Hapus data pakan ini?")) {
-                                    await db.feed_data.delete(feed.id);
+                                  if (feed.id) {
+                                    setDeleteType('feed');
+                                    setDeleteConfirmId(feed.id);
                                   }
                                 }}
                               >
-                                <Trash2 size={14} /> Hapus Data Pakan
+                                <Trash2 size={14} /> Hapus
                               </Button>
                             </div>
                           </Card>
@@ -1626,14 +2453,24 @@ export default function App() {
                       <div className="min-w-full snap-center px-1">
                         <Card className="p-8 text-center bg-white/10 backdrop-blur-md border-white/20">
                           <div className="p-3 bg-white/10 rounded-full w-fit mx-auto mb-3">
-                            <Zap size={24} className="text-white/60" />
+                            <FileText size={24} className="text-white/60" />
                           </div>
                           <p className="text-white font-bold text-sm">Belum ada data pakan</p>
                           <p className="text-white/60 text-[10px]">Gunakan form di atas untuk menambah data</p>
                         </Card>
                       </div>
+                    )) : (
+                      <div className="min-w-full snap-center px-1">
+                        <Card className="p-8 text-center bg-white/10 backdrop-blur-md border-white/20">
+                          <div className="p-3 bg-white/10 rounded-full w-fit mx-auto mb-3">
+                            <Search size={24} className="text-white/60" />
+                          </div>
+                          <p className="text-white font-bold text-sm">Cari Riwayat Pakan</p>
+                          <p className="text-white/60 text-[10px]">Contoh: 03 untuk melihat riwayat pakan bulan Maret</p>
+                        </Card>
+                      </div>
                     )
-                  ) : (searchQuery.trim() !== '' || showAll || !(view === 'bibit_list' || view === 'keramba_list')) ? (
+                  ) : (searchQuery.trim() !== '' || showAll) ? (
                     filteredReports.map(report => (
                       <div key={report.id || Math.random()} className="min-w-full snap-center px-1">
                         <Card key={report.id || Math.random()} className="p-4 overflow-hidden shadow-xl border-white/20 bg-white/95 backdrop-blur-sm">
@@ -1672,13 +2509,30 @@ export default function App() {
                                 <div className="font-bold text-right text-emerald-900">{report.size_category}</div>
                                 <div className="text-slate-500">Harga:</div>
                                 <div className="font-bold text-right text-emerald-900">Rp {report.price?.toLocaleString() || '0'}</div>
+                                {report.quantity && report.price && (
+                                  <>
+                                    <div className="text-emerald-600 font-bold">Total Investasi:</div>
+                                    <div className="font-black text-right text-emerald-700">Rp {(report.quantity * report.price).toLocaleString()}</div>
+                                  </>
+                                )}
+                                {report.description && (
+                                  <>
+                                    <div className="text-slate-500">Keterangan:</div>
+                                    <div className="font-medium text-right text-[10px] italic text-slate-600 whitespace-pre-wrap">{report.description}</div>
+                                  </>
+                                )}
                                 {report.notes && (
                                   <>
                                     <div className="text-slate-500">Catatan:</div>
-                                    <div className="font-medium text-right text-[10px] italic text-slate-600">{report.notes}</div>
+                                    <div className="font-medium text-right text-[10px] italic text-slate-600 whitespace-pre-wrap">{report.notes}</div>
                                   </>
                                 )}
                               </div>
+                              {report.updatedAt && (
+                                <p className="text-[8px] text-slate-400 mt-2 italic text-right">
+                                  Data terakhir di update: {format(new Date(report.updatedAt), 'dd MMM yyyy HH:mm')}
+                                </p>
+                              )}
                             </div>
                           )}
 
@@ -1690,7 +2544,7 @@ export default function App() {
                               </div>
                               <div className="p-3 bg-blue-50/50 rounded-xl border border-blue-100">
                                 <div className="flex justify-between items-center mb-2">
-                                  <span className="text-[9px] font-bold text-blue-600 uppercase">Hasil Sortir</span>
+                                  <span className="text-[9px] font-bold text-blue-600 uppercase">Tanggal Sortir</span>
                                   {report.sorting_date && (
                                     <span className="text-[8px] text-blue-500 bg-white px-1.5 py-0.5 rounded border border-blue-100 font-medium">
                                       {format(new Date(report.sorting_date), 'dd/MM/yy')}
@@ -1727,10 +2581,15 @@ export default function App() {
                                 <div className="space-y-1 mt-2 pt-2 border-t border-blue-100/50">
                                   {report.notes && (
                                     <div className="text-[10px] pt-1">
-                                      <p className="text-slate-600 italic bg-white/50 p-1.5 rounded-md border border-blue-100/30">{report.notes}</p>
+                                      <p className="text-slate-600 italic bg-white/50 p-1.5 rounded-md border border-blue-100/30 whitespace-pre-wrap">{report.notes}</p>
                                     </div>
                                   )}
                                 </div>
+                                {report.updatedAt && (
+                                  <p className="text-[8px] text-slate-400 mt-1 italic text-right">
+                                    Data terakhir di update: {format(new Date(report.updatedAt), 'dd MMM yyyy HH:mm')}
+                                  </p>
+                                )}
                               </div>
                             </div>
                           )}
@@ -1746,7 +2605,10 @@ export default function App() {
                                     className="flex-1 text-[11px] h-10 px-2" 
                                     onClick={(e) => {
                                       e.stopPropagation();
-                                      if (report.id) setDeleteConfirmId(report.id);
+                                      if (report.id) {
+                                        setDeleteType('report');
+                                        setDeleteConfirmId(report.id);
+                                      }
                                     }}
                                   >
                                     <Trash2 size={14} /> Hapus Data Ini
@@ -1755,7 +2617,10 @@ export default function App() {
                                   <>
                                     <Button variant="ghost" className="flex-1 text-[10px] h-8 px-2" onClick={() => {
                                       setEditingReport(report);
-                                      setFormData(report);
+                                      setFormData({
+                                        ...report,
+                                        keramba_entries: report.keramba_entries || []
+                                      });
                                       setSelectedCommodity(report.commodity_id);
                                       setView('form'); // Go directly to form since section is already set
                                     }}>
@@ -1768,6 +2633,7 @@ export default function App() {
                                         onClick={(e) => {
                                           e.stopPropagation();
                                           if (report.id) {
+                                            setDeleteType('report');
                                             setDeleteConfirmId(report.id);
                                           } else {
                                             alert("Maaf, data ini tidak memiliki ID. Silakan buat data baru.");
@@ -1786,61 +2652,53 @@ export default function App() {
                         </Card>
                       </div>
                     ))
-                  ) : (
-                    <div className="min-w-full py-20 text-center space-y-4 bg-white/5 backdrop-blur-md rounded-3xl border border-white/10">
-                      <div className="w-20 h-20 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto">
-                        <Search size={40} className="text-emerald-400" />
-                      </div>
-                      <div className="space-y-1">
-                        <p className="text-white font-bold text-lg">Belum Ada Laporan</p>
-                        <p className="text-emerald-100/60 text-sm">Gunakan pencarian atau tambah data baru</p>
-                      </div>
-                    </div>
-                  )}
+                   ) : null}
                 </div>
-                {searchQuery.trim() !== '' && filteredReports.length === 0 && (
-                  <div className="py-12 text-center space-y-4">
-                    <div className="w-16 h-16 bg-white/10 rounded-full flex items-center justify-center mx-auto">
-                      <Search size={32} className="text-white/40" />
-                    </div>
-                    <div className="space-y-1">
-                      <p className="text-white font-bold">Tidak ada data ditemukan</p>
-                      <p className="text-emerald-100/60 text-xs">Coba gunakan kata kunci lain</p>
-                    </div>
-                    <Button variant="secondary" onClick={() => setView('search_landing')} className="mx-auto">
-                      Kembali Cari
-                    </Button>
-                  </div>
-                )}
               </div>
             </div>
           )}
 
           {view === 'pakan_ikan' && (
             <div className="space-y-4 animate-in fade-in slide-in-from-right-4 duration-300">
-              <div className="flex items-center gap-2">
-                <Button variant="ghost" onClick={() => setView('home')} className="p-2 text-white hover:bg-white/20">
-                  <ChevronLeft size={24} />
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Button variant="ghost" onClick={() => {
+                    if (selectedCommodity) {
+                      setView('commodity_dashboard');
+                    } else {
+                      setView('home');
+                    }
+                  }} className="p-2 text-white hover:bg-white/20">
+                    <ChevronLeft size={24} />
+                  </Button>
+                  <h2 className="text-xl font-bold text-white">Form Pakan Ikan</h2>
+                </div>
+                <Button 
+                  variant="ghost" 
+                  onClick={() => setIsFeedFormExpanded(!isFeedFormExpanded)} 
+                  className="p-2 text-white hover:bg-white/20"
+                >
+                  {isFeedFormExpanded ? <ChevronUp size={24} /> : <ChevronDown size={24} />}
                 </Button>
-                <h2 className="text-xl font-bold text-white">Form Pakan Ikan</h2>
               </div>
 
-              <Card className="p-6 space-y-4">
-                <form onSubmit={handleSaveFeed} className="space-y-4">
+              {isFeedFormExpanded && (
+                <Card className="p-6 space-y-4 animate-in fade-in slide-in-from-top-2 duration-300">
+                  <form onSubmit={handleSaveFeed} className="space-y-4">
                   <div className="space-y-3">
                     <div>
-                      <label className="text-[10px] font-bold text-slate-500 uppercase">Tgl</label>
+                      <label className="text-[10px] font-bold text-black uppercase">Tgl</label>
                       <input 
                         type="date" 
-                        className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-emerald-500" 
+                        className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-emerald-500 text-black font-bold" 
                         value={feedForm.date || ''} 
                         onChange={e => setFeedForm({...feedForm, date: e.target.value})} 
                       />
                     </div>
                     <div>
-                      <label className="text-[10px] font-bold text-slate-500 uppercase">Jenis Pakan</label>
+                      <label className="text-[10px] font-bold text-black uppercase">Jenis Pakan</label>
                       <select 
-                        className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-emerald-500" 
+                        className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-emerald-500 text-black font-bold" 
                         value={feedForm.feed_type || ''} 
                         onChange={e => setFeedForm({...feedForm, feed_type: e.target.value})}
                       >
@@ -1852,36 +2710,91 @@ export default function App() {
                       </select>
                     </div>
                     <div>
-                      <label className="text-[10px] font-bold text-slate-500 uppercase">Jumlah (Sak)</label>
+                      <label className="text-[10px] font-bold text-black uppercase">Jumlah (Sak)</label>
                       <input 
                         type="number" 
-                        className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-emerald-500" 
+                        className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-emerald-500 text-black font-bold" 
                         value={feedForm.quantity || 0} 
                         onChange={e => setFeedForm({...feedForm, quantity: Number(e.target.value)})} 
                       />
                     </div>
+                    
+                    <Button 
+                      type="button"
+                      onClick={addFeedEntry}
+                      className="w-full py-2 bg-slate-100 text-black hover:bg-slate-200 border border-slate-200 rounded-xl text-[10px] font-bold uppercase tracking-wider"
+                    >
+                      <Plus size={14} className="mr-1" /> Tambah Data Pakan
+                    </Button>
+
+                    {feedForm.feed_entries && feedForm.feed_entries.length > 0 && (
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-bold text-black uppercase ml-1">Daftar Pakan</label>
+                        <div className="space-y-2">
+                          {feedForm.feed_entries.map((entry, index) => (
+                            <div key={index} className="flex items-center justify-between p-3 bg-white rounded-xl border border-slate-100 shadow-sm">
+                              <div className="flex flex-col">
+                                <span className="text-sm font-bold text-black">{entry.feed_type}</span>
+                                <span className="text-[10px] text-black font-medium">{entry.quantity} Sak</span>
+                              </div>
+                              <button 
+                                type="button"
+                                onClick={() => removeFeedEntry(index)}
+                                className="p-2 text-rose-500 hover:bg-rose-50 rounded-lg transition-colors"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     <div>
-                      <label className="text-[10px] font-bold text-slate-500 uppercase">Catatan</label>
+                      <label className="text-[10px] font-bold text-black uppercase">Catatan</label>
                       <textarea 
-                        className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-emerald-500" 
+                        className="w-full p-3 bg-slate-50 rounded-xl border-none text-sm focus:ring-2 focus:ring-emerald-500 text-black font-bold" 
                         rows={3} 
                         value={feedForm.notes || ''} 
                         onChange={e => setFeedForm({...feedForm, notes: e.target.value})} 
                       />
                     </div>
                   </div>
-                  <Button 
-                    type="submit"
-                    className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-xl shadow-lg"
-                  >
-                    Simpan Data Pakan
-                  </Button>
+                  <div className="flex gap-2">
+                    {editingFeed && (
+                      <Button 
+                        variant="secondary" 
+                        className="flex-1 py-3 text-sm rounded-xl"
+                        onClick={() => {
+                          setEditingFeed(null);
+                          setSearchQuery(''); // Reset search query
+                          setShowAll(false); // Reset show all
+                          setFeedForm({
+                            date: format(new Date(), 'yyyy-MM-dd'),
+                            feed_type: 'pf 500',
+                            quantity: 0,
+                            notes: '',
+                            feed_entries: []
+                          });
+                        }}
+                      >
+                        Batal
+                      </Button>
+                    )}
+                    <Button 
+                      type="submit"
+                      className={cn("py-3 font-bold rounded-xl shadow-lg", editingFeed ? "flex-[2] bg-orange-600 hover:bg-orange-500" : "w-full bg-emerald-600 hover:bg-emerald-500")}
+                    >
+                      {editingFeed ? 'Update Data Pakan' : 'Simpan Data Pakan'}
+                    </Button>
+                  </div>
                 </form>
                 {showFeedSuccess && (
                   <p className="text-sm text-emerald-600 font-bold text-center animate-bounce">Data Pakan berhasil disimpan!</p>
                 )}
               </Card>
-            </div>
+            )}
+          </div>
           )}
 
           {view === 'form' && (
@@ -1891,6 +2804,8 @@ export default function App() {
                   if (formSection === 'all') {
                     setView('list');
                     setEditingReport(null);
+                    setSearchQuery(''); // Reset search query
+                    setShowAll(false); // Reset show all
                   } else {
                     setView('commodity_dashboard');
                   }
@@ -1980,12 +2895,13 @@ export default function App() {
                         </div>
                       </div>
                       <div>
-                        <label className="text-xs font-bold text-slate-500 uppercase">Catatan</label>
-                        <input 
-                          type="text" 
+                        <label className="text-xs font-bold text-slate-500 uppercase">Keterangan</label>
+                        <textarea 
                           className="w-full p-3 bg-slate-50 rounded-xl border-none focus:ring-2 focus:ring-emerald-500"
-                          value={formData.notes || ''}
-                          onChange={e => setFormData({...formData, notes: e.target.value})}
+                          rows={2}
+                          value={formData.description || ''}
+                          onChange={e => setFormData({...formData, description: e.target.value})}
+                          placeholder="Tambahkan keterangan di sini..."
                         />
                       </div>
                     </div>
@@ -1997,11 +2913,6 @@ export default function App() {
                     <h3 className="font-bold text-emerald-800 border-b pb-2">Data Keramba / Kolam</h3>
                     <div className="space-y-4">
                       <div>
-                        <label className="text-xs font-bold text-slate-500 uppercase">Tanggal Sortir</label>
-                        <input type="date" className="w-full p-3 bg-slate-50 rounded-xl border-none" value={formData.sorting_date || ''} onChange={e => setFormData({...formData, sorting_date: e.target.value})} />
-                      </div>
-                      
-                      <div>
                         <label className="text-xs font-bold text-slate-500 uppercase">Kode Kolam</label>
                         <select 
                           className="w-full p-3 bg-slate-50 rounded-xl border-none appearance-none" 
@@ -2009,38 +2920,102 @@ export default function App() {
                           onChange={e => setFormData({...formData, code: e.target.value})}
                         >
                           <option value="">Pilih Kode</option>
-                          {[
-                            ...Array.from({ length: 50 }, (_, i) => `B.A${i + 1}`),
-                            ...Array.from({ length: 30 }, (_, i) => `A${i + 1}`),
-                            ...Array.from({ length: 8 }, (_, i) => `K.B${i + 1}`),
-                            ...Array.from({ length: 4 }, (_, i) => `K.T${i + 1}`),
-                          ].map(code => (
+                          {ALL_POND_CODES.filter(code => {
+                            // If editing, allow the current code
+                            const isCurrentCode = editingReport && (
+                              editingReport.code === code || 
+                              (editingReport.code && editingReport.code.split(',').map(c => c.trim()).includes(code))
+                            );
+                            if (isCurrentCode) return true;
+
+                            // Filter out codes that already have ANY report
+                            // If a pond is in any report, it's considered "occupied"
+                            const isUsedInOtherReports = reports.some(r => 
+                              r.code && 
+                              r.code.split(',').map(c => c.trim()).includes(code)
+                            );
+
+                            // Filter out codes that are already in the current entries list (to prevent adding same code twice in one report)
+                            const isUsedInCurrentEntries = formData.keramba_entries?.some(e => e.code === code);
+                            
+                            return !isUsedInOtherReports && !isUsedInCurrentEntries;
+                          }).map(code => (
                             <option key={code} value={code}>{code}</option>
                           ))}
                         </select>
                       </div>
 
                       <div className="p-4 bg-emerald-50/50 rounded-2xl border border-emerald-100/50">
-                        <label className="text-xs font-bold text-emerald-700 uppercase block mb-3">Keterangan Ukuran (kg)</label>
-                        <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <label className="text-[10px] font-bold text-slate-400 uppercase">Panen</label>
-                            <input type="number" className="w-full p-2 bg-white rounded-lg border border-emerald-100" value={formData.harvest || 0} onChange={e => setFormData({...formData, harvest: Number(e.target.value)})} />
+                        <div className="flex items-center justify-between mb-3">
+                          <label className="text-xs font-bold text-emerald-700 uppercase block">Keterangan Ukuran (kg)</label>
+                          <button 
+                            type="button"
+                            onClick={() => setIsSizeInfoExpanded(!isSizeInfoExpanded)}
+                            className="p-1.5 bg-emerald-100 text-emerald-700 rounded-lg hover:bg-emerald-200 transition-colors flex items-center gap-1.5 text-[10px] font-bold"
+                          >
+                            {isSizeInfoExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                            <span>{isSizeInfoExpanded ? 'Minimize' : 'Expand'}</span>
+                          </button>
+                        </div>
+                        {isSizeInfoExpanded && (
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <label className="text-[10px] font-bold text-slate-400 uppercase">Panen</label>
+                              <input type="number" className="w-full p-2 bg-white rounded-lg border border-emerald-100" value={formData.harvest || 0} onChange={e => setFormData({...formData, harvest: Number(e.target.value)})} />
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-bold text-slate-400 uppercase">Sedang</label>
+                              <input type="number" className="w-full p-2 bg-white rounded-lg border border-emerald-100" value={formData.medium || 0} onChange={e => setFormData({...formData, medium: Number(e.target.value)})} />
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-bold text-slate-400 uppercase">Kecil</label>
+                              <input type="number" className="w-full p-2 bg-white rounded-lg border border-emerald-100" value={formData.small || 0} onChange={e => setFormData({...formData, small: Number(e.target.value)})} />
+                            </div>
+                            <div>
+                              <label className="text-[10px] font-bold text-slate-400 uppercase">Jumbo</label>
+                              <input type="number" className="w-full p-2 bg-white rounded-lg border border-emerald-100" value={formData.jumbo || 0} onChange={e => setFormData({...formData, jumbo: Number(e.target.value)})} />
+                            </div>
                           </div>
-                          <div>
-                            <label className="text-[10px] font-bold text-slate-400 uppercase">Sedang</label>
-                            <input type="number" className="w-full p-2 bg-white rounded-lg border border-emerald-100" value={formData.medium || 0} onChange={e => setFormData({...formData, medium: Number(e.target.value)})} />
-                          </div>
-                          <div>
-                            <label className="text-[10px] font-bold text-slate-400 uppercase">Kecil</label>
-                            <input type="number" className="w-full p-2 bg-white rounded-lg border border-emerald-100" value={formData.small || 0} onChange={e => setFormData({...formData, small: Number(e.target.value)})} />
-                          </div>
-                          <div>
-                            <label className="text-[10px] font-bold text-slate-400 uppercase">Jumbo</label>
-                            <input type="number" className="w-full p-2 bg-white rounded-lg border border-emerald-100" value={formData.jumbo || 0} onChange={e => setFormData({...formData, jumbo: Number(e.target.value)})} />
+                        )}
+                      </div>
+
+                      <Button 
+                        onClick={addKerambaEntry}
+                        className="w-full py-3 bg-emerald-100 text-emerald-700 hover:bg-emerald-200 border border-emerald-200 rounded-2xl text-xs font-black uppercase tracking-widest"
+                      >
+                        <Plus size={16} /> Tambah Data Keramba
+                      </Button>
+
+                      {formData.keramba_entries && formData.keramba_entries.length > 0 && (
+                        <div className="space-y-2">
+                          <label className="text-xs font-bold text-slate-500 uppercase ml-1">Daftar Keramba</label>
+                          <div className="space-y-2">
+                            {formData.keramba_entries.map((entry, index) => (
+                              <div key={index} className="flex items-center justify-between p-3 bg-white rounded-2xl border border-emerald-100 shadow-sm">
+                                <div className="flex flex-col">
+                                  <span className="text-sm font-black text-slate-700">{entry.code}</span>
+                                  <span className="text-[10px] text-slate-500 font-bold">
+                                    {[
+                                      entry.harvest > 0 && `P:${entry.harvest}kg`,
+                                      entry.medium > 0 && `S:${entry.medium}kg`,
+                                      entry.small > 0 && `K:${entry.small}kg`,
+                                      entry.jumbo > 0 && `J:${entry.jumbo}kg`
+                                    ].filter(Boolean).join(' | ')}
+                                  </span>
+                                </div>
+                                <button 
+                                  type="button"
+                                  onClick={() => removeKerambaEntry(index)}
+                                  className="p-2 text-rose-500 hover:bg-rose-50 rounded-xl transition-colors"
+                                >
+                                  <Trash2 size={16} />
+                                </button>
+                              </div>
+                            ))}
                           </div>
                         </div>
-                      </div>
+                      )}
+
 
                       <div>
                         <label className="text-xs font-bold text-slate-500 uppercase">Catatan</label>
@@ -2050,7 +3025,7 @@ export default function App() {
                   </Card>
                 )}
 
-                <Button className="w-full py-4 text-lg shadow-xl shadow-emerald-900/20">
+                <Button type="submit" ref={submitButtonRef} className="w-full py-4 text-lg shadow-xl shadow-emerald-900/20">
                   <CheckCircle2 size={20} />
                   Simpan Laporan
                 </Button>
@@ -2064,7 +3039,7 @@ export default function App() {
                 <Button variant="ghost" onClick={() => setView('home')} className="p-2">
                   <ChevronLeft size={24} />
                 </Button>
-                <h2 className="text-xl font-bold text-white">Analisa Data</h2>
+                <h2 className="text-xl font-bold text-white">Grafik</h2>
               </div>
 
               <Card className="p-6">
@@ -2090,304 +3065,281 @@ export default function App() {
                 <Button variant="ghost" onClick={() => setView('home')} className="p-2">
                   <ChevronLeft size={24} />
                 </Button>
-                <h2 className="text-xl font-bold text-white">Menu Panen</h2>
+                <h2 className="text-xl font-bold text-white">Analisa Budidaya</h2>
               </div>
 
-              <Card className="p-4 bg-white/10 backdrop-blur-md border-white/20 space-y-4">
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-[10px] font-bold text-emerald-100 uppercase block mb-2">Tanggal Panen</label>
-                    <input 
-                      type="date" 
-                      className="w-full p-3 bg-white rounded-xl border-none text-slate-800 font-medium"
-                      value={harvestForm.date}
-                      onChange={(e) => setHarvestForm({...harvestForm, date: e.target.value})}
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[10px] font-bold text-emerald-100 uppercase block mb-2">Pilih Komoditas</label>
-                    <select 
-                      className="w-full p-3 bg-white rounded-xl border-none text-slate-800 font-medium appearance-none"
-                      value={selectedCommodity || ''}
-                      onChange={(e) => setSelectedCommodity(Number(e.target.value))}
-                    >
-                      <option value="">Pilih...</option>
-                      {commodities.map(c => (
-                        <option key={c.id} value={c.id}>{c.name}</option>
-                      ))}
-                    </select>
+              <Card className="p-5 bg-white backdrop-blur-md border-white/20 space-y-6">
+                <div className="space-y-4">
+                  <h3 className="text-xs font-black text-slate-900 uppercase tracking-widest border-b border-slate-200 pb-2">Parameter</h3>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] font-bold text-black uppercase ml-1">Jumlah Bibit (ekor)</label>
+                      <input 
+                        type="number" 
+                        className="w-full p-3 bg-slate-50 rounded-2xl border border-slate-200 text-black font-bold shadow-inner focus:ring-2 focus:ring-emerald-500/20 outline-none"
+                        value={analisaForm.jumlahBibit || ''}
+                        onChange={(e) => setAnalisaForm({...analisaForm, jumlahBibit: Number(e.target.value)})}
+                      />
+                    </div>
+                    
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] font-bold text-black uppercase ml-1">Persentase Gagal (%)</label>
+                      <input 
+                        type="number" 
+                        className="w-full p-3 bg-slate-50 rounded-2xl border border-slate-200 text-black font-bold shadow-inner focus:ring-2 focus:ring-emerald-500/20 outline-none"
+                        value={analisaForm.persentaseGagal || ''}
+                        onChange={(e) => setAnalisaForm({...analisaForm, persentaseGagal: Number(e.target.value)})}
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] font-bold text-black uppercase ml-1">FCR (Feed Conversion Ratio)</label>
+                      <input 
+                        type="number" 
+                        step="0.1"
+                        className="w-full p-3 bg-slate-50 rounded-2xl border border-slate-200 text-black font-bold shadow-inner focus:ring-2 focus:ring-emerald-500/20 outline-none"
+                        value={analisaForm.fcr || ''}
+                        onChange={(e) => setAnalisaForm({...analisaForm, fcr: Number(e.target.value)})}
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] font-bold text-black uppercase ml-1">Total Pakan (kg)</label>
+                      <input 
+                        type="number" 
+                        className="w-full p-3 bg-slate-50 rounded-2xl border border-slate-200 text-black font-bold shadow-inner focus:ring-2 focus:ring-emerald-500/20 outline-none"
+                        value={analisaForm.totalPakan || ''}
+                        onChange={(e) => setAnalisaForm({...analisaForm, totalPakan: Number(e.target.value)})}
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] font-bold text-black uppercase ml-1">Modal per kg (Rp)</label>
+                      <input 
+                        type="number" 
+                        className="w-full p-3 bg-slate-50 rounded-2xl border border-slate-200 text-black font-bold shadow-inner focus:ring-2 focus:ring-emerald-500/20 outline-none"
+                        value={analisaForm.modalPerKg || ''}
+                        onChange={(e) => setAnalisaForm({...analisaForm, modalPerKg: Number(e.target.value)})}
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] font-bold text-black uppercase ml-1">Harga Jual per kg (Rp)</label>
+                      <input 
+                        type="number" 
+                        className="w-full p-3 bg-slate-50 rounded-2xl border border-slate-200 text-black font-bold shadow-inner focus:ring-2 focus:ring-emerald-500/20 outline-none"
+                        value={analisaForm.hargaJualPerKg || ''}
+                        onChange={(e) => setAnalisaForm({...analisaForm, hargaJualPerKg: Number(e.target.value)})}
+                      />
+                    </div>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 gap-3">
-                  <div>
-                    <label className="text-[10px] font-bold text-emerald-100 uppercase block mb-2">Total Panen (kg)</label>
-                    <input 
-                      type="number" 
-                      className="w-full p-3 bg-white rounded-xl border-none text-slate-800 font-medium"
-                      value={harvestForm.total_harvest || ''}
-                      onChange={(e) => setHarvestForm({...harvestForm, total_harvest: Number(e.target.value)})}
-                    />
+                <div className="space-y-4 pt-2">
+                  <h3 className="text-xs font-black text-black uppercase tracking-widest border-b border-slate-200 pb-2">Hasil Perhitungan</h3>
+                  
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200">
+                      <p className="text-[9px] font-bold text-black uppercase mb-1">Estimasi Panen</p>
+                      <p className="text-lg font-black text-black">{analisaResult.estimasiPanen.toLocaleString('id-ID')} <span className="text-[10px] font-normal text-black">kg</span></p>
+                    </div>
+                    
+                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200">
+                      <p className="text-[9px] font-bold text-black uppercase mb-1">Total Modal</p>
+                      <p className="text-lg font-black text-black">Rp {analisaResult.totalModal.toLocaleString('id-ID')}</p>
+                    </div>
+
+                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200">
+                      <p className="text-[9px] font-bold text-black uppercase mb-1">Total Omzet</p>
+                      <p className="text-lg font-black text-black">Rp {analisaResult.totalOmzet.toLocaleString('id-ID')}</p>
+                    </div>
+
+                    <div className="p-4 bg-emerald-50 rounded-2xl border border-emerald-100">
+                      <p className="text-[9px] font-bold text-black uppercase mb-1">Keuntungan</p>
+                      <p className="text-lg font-black text-black">Rp {analisaResult.keuntungan.toLocaleString('id-ID')}</p>
+                    </div>
+                  </div>
+
+                  <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 flex justify-between items-center">
+                    <div>
+                      <p className="text-[9px] font-bold text-black uppercase">Estimasi Ikan Hidup</p>
+                      <p className="text-sm font-bold text-black">{analisaResult.survivors.toLocaleString('id-ID')} ekor</p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-[9px] font-bold text-black uppercase">Rata-rata Bobot</p>
+                      <p className="text-sm font-bold text-black">
+                        {analisaResult.survivors > 0 ? (analisaResult.estimasiPanen / analisaResult.survivors).toFixed(2) : 0} kg/ekor
+                      </p>
+                    </div>
                   </div>
                 </div>
-
-                <div>
-                  <label className="text-[10px] font-bold text-emerald-100 uppercase block mb-2">Catatan</label>
-                  <textarea 
-                    className="w-full p-3 bg-white rounded-xl border-none text-slate-800 font-medium min-h-[80px]"
-                    placeholder="Isi catatan panen..."
-                    value={harvestForm.notes}
-                    onChange={(e) => setHarvestForm({...harvestForm, notes: e.target.value})}
-                  />
-                </div>
-
-                <Button 
-                  onClick={handleSaveHarvest}
-                  className="w-full py-3 bg-red-600 hover:bg-red-500 text-white shadow-lg shadow-red-900/20"
-                >
-                  <CheckCircle2 size={18} />
-                  Simpan Data Panen
-                </Button>
-
-                {showHarvestSuccess && (
-                  <div className="p-3 bg-emerald-500/20 border border-emerald-500/50 rounded-xl text-emerald-100 text-center text-xs font-bold animate-in fade-in zoom-in duration-300">
-                    Data panen telah disimpan
-                  </div>
-                )}
               </Card>
-
-              <div className="space-y-3">
-                <h3 className="text-sm font-bold text-white uppercase px-1">Riwayat Panen</h3>
-                {harvests.length === 0 ? (
-                  <Card className="p-8 text-center bg-white/5 border-white/10">
-                    <p className="text-white/40 text-sm italic">Belum ada data panen</p>
-                  </Card>
-                ) : (
-                  harvests
-                    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
-                    .map(harvest => (
-                      <Card key={harvest.id} className="p-4 border-red-200 shadow-sm">
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center gap-2">
-                            <div>
-                              <h4 className="font-bold text-slate-800">{harvest.commodity_name}</h4>
-                              <p className="text-[10px] text-slate-500">{harvest.date}</p>
-                            </div>
-                          </div>
-                          <div className="text-right">
-                            <div className="text-sm font-bold text-emerald-600">{harvest.total_harvest} kg</div>
-                          </div>
-                        </div>
-                        {harvest.notes && (
-                          <div className="mt-2 p-2 bg-slate-50 rounded-lg text-[10px] text-slate-600 italic">
-                            {harvest.notes}
-                          </div>
-                        )}
-                      </Card>
-                    ))
-                )}
-              </div>
             </div>
           )}
 
           {view === 'reminders' && (
             <div className="space-y-4 animate-in fade-in slide-in-from-top-4 duration-300">
-              <div className="flex items-center gap-2">
-                <Button variant="ghost" onClick={() => setView('home')} className="p-2">
-                  <ChevronLeft size={24} />
-                </Button>
-                <h2 className="text-xl font-bold text-white">Jadwal Sortir</h2>
+              <div className="flex items-center justify-between px-1">
+                <div className="flex items-center gap-2">
+                  <Button variant="ghost" onClick={() => setView('home')} className="p-2 text-white">
+                    <ChevronLeft size={24} />
+                  </Button>
+                  <h2 className="text-xs font-black text-white uppercase tracking-widest">Riwayat Laporan</h2>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={() => scroll('left')} className="p-2 bg-white/10 rounded-xl text-white active:scale-90 transition-all">
+                    <ChevronLeft size={16} />
+                  </button>
+                  <button onClick={() => scroll('right')} className="p-2 bg-white/10 rounded-xl text-white active:scale-90 transition-all">
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
               </div>
 
-              <Card className="p-4 bg-white/10 backdrop-blur-md border-white/20 space-y-4">
-                <div>
-                  <label className="text-[10px] font-bold text-emerald-100 uppercase block mb-2">Pilih Tanggal Sortir</label>
-                  <input 
-                    type="date" 
-                    className="w-full p-3 bg-white rounded-xl border-none text-slate-800 font-medium"
-                    value={searchQuery || new Date().toISOString().split('T')[0]}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                  />
-                </div>
-                
-                <div className="grid grid-cols-1 gap-3">
+              <Card className="p-5 bg-white/10 backdrop-blur-md border-white/20 space-y-5">
+                <div className="space-y-4">
                   <div>
-                    <label className="text-[10px] font-bold text-emerald-100 uppercase block mb-2">Kode Kolam</label>
-                    <select 
-                      className="w-full p-3 bg-white rounded-xl border-none text-slate-800 font-medium appearance-none"
-                      value={pondFilter}
-                      onChange={(e) => setPondFilter(e.target.value)}
+                    <label className="text-[9px] font-black text-emerald-100 uppercase tracking-widest block mb-1.5 ml-1">Cari Kode Kolam</label>
+                    <div className="relative group">
+                      <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                        <Anchor size={18} className="text-emerald-500 group-focus-within:text-emerald-400 transition-colors" />
+                      </div>
+                      <input 
+                        list="pond-codes"
+                        type="text"
+                        placeholder="Masukkan Kode Kolam (A1, B.A5, dll)"
+                        className="w-full pl-11 pr-4 py-3 bg-white rounded-xl border-none text-slate-800 font-bold placeholder:text-slate-300 focus:ring-4 focus:ring-emerald-500/20 transition-all shadow-inner text-sm"
+                        value={pondFilter}
+                        onChange={(e) => {
+                          setPondFilter(e.target.value);
+                          setIsSearchPerformed(false);
+                        }}
+                      />
+                      <datalist id="pond-codes">
+                        {[
+                          ...Array.from({ length: 14 }, (_, i) => `B.A${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 6 }, (_, i) => `B.B${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 14 }, (_, i) => `B.C${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 6 }, (_, i) => `B.D${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 9 }, (_, i) => `A${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 8 }, (_, i) => `B${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 5 }, (_, i) => `C${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 5 }, (_, i) => `D${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 8 }, (_, i) => `K.B ${(i + 1).toString().padStart(2, '0')}`),
+                          ...Array.from({ length: 4 }, (_, i) => `K.T${i + 1}`),
+                        ].map(code => (
+                          <option key={code} value={code} />
+                        ))}
+                      </datalist>
+                    </div>
+                  </div>
+
+                  <div className="flex gap-3">
+                    <Button 
+                      onClick={() => setIsSearchPerformed(true)}
+                      className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-500 text-white shadow-xl shadow-emerald-900/20 rounded-xl text-xs font-black uppercase tracking-wider active:scale-95 transition-all"
                     >
-                      <option value="">Semua Kolam</option>
-                      {[
-                        ...Array.from({ length: 50 }, (_, i) => `B.A${i + 1}`),
-                        ...Array.from({ length: 30 }, (_, i) => `A${i + 1}`),
-                        ...Array.from({ length: 8 }, (_, i) => `K.B${i + 1}`),
-                        ...Array.from({ length: 4 }, (_, i) => `K.T${i + 1}`),
-                      ].map(code => (
-                        <option key={code} value={code}>{code}</option>
-                      ))}
-                    </select>
-                  </div>
-                  
-                  <div>
-                    <label className="text-[10px] font-bold text-emerald-100 uppercase block mb-2">Catatan</label>
-                    <input 
-                      type="text" 
-                      placeholder="Isi catatan..."
-                      className="w-full p-3 bg-white rounded-xl border-none text-slate-800 font-medium placeholder:text-slate-300"
-                      value={notesFilter}
-                      onChange={(e) => setNotesFilter(e.target.value)}
-                    />
+                      <Search size={18} />
+                      Cari Riwayat
+                    </Button>
+                    {pondFilter && (
+                      <button 
+                        onClick={() => {
+                          setPondFilter('');
+                          setIsSearchPerformed(false);
+                        }}
+                        className="p-3 bg-white/10 hover:bg-white/20 text-white rounded-xl transition-all active:scale-95"
+                        title="Reset"
+                      >
+                        <Trash2 size={18} />
+                      </button>
+                    )}
                   </div>
                 </div>
-
-                <Button 
-                  onClick={handleQuickSaveSorting}
-                  className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/20"
-                >
-                  <CheckCircle2 size={18} />
-                  Simpan Jadwal
-                </Button>
-
-                {showSortingSuccess && (
-                  <div className="p-3 bg-emerald-500/20 border border-emerald-500/50 rounded-xl text-emerald-100 text-center text-xs font-bold animate-in fade-in zoom-in duration-300">
-                    Data telah disimpan
-                  </div>
-                )}
               </Card>
 
-              <div className="space-y-3">
-                {reports
-                  .filter(r => {
-                    const matchesSection = r.formSection === 'klarifikasi_ukuran';
-                    const matchesDate = r.sorting_date === (searchQuery || new Date().toISOString().split('T')[0]);
-                    const matchesPond = pondFilter === '' || r.code === pondFilter;
-                    const matchesNotes = notesFilter === '' || (r.notes && r.notes.toLowerCase().includes(notesFilter.toLowerCase()));
-                    return matchesSection && matchesDate && matchesPond && matchesNotes;
-                  })
-                  .map(report => (
-                    <Card key={report.id} className="p-4 border-emerald-200 shadow-sm">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-2">
-                          <div className="flex flex-col">
-                            <span className="text-[8px] font-bold text-emerald-500 uppercase">Kode Kolam</span>
-                            <div className="p-2 bg-emerald-100 text-emerald-600 rounded-lg font-bold text-sm">
-                              {report.code}
+              <div 
+                ref={scrollRef}
+                className="flex overflow-x-auto snap-x snap-mandatory no-scrollbar gap-4 pb-4 px-1"
+              >
+                {!isSearchPerformed && (
+                  <div className="min-w-full text-center py-16 bg-white/5 backdrop-blur-md rounded-3xl border border-white/10 border-dashed">
+                    <div className="w-16 h-16 bg-emerald-500/20 rounded-full flex items-center justify-center mx-auto mb-4">
+                      <Search size={32} className="text-emerald-400" />
+                    </div>
+                    <p className="text-white font-black uppercase tracking-widest text-xs">Siap Mencari</p>
+                    <p className="text-emerald-100/40 text-[10px] mt-1">Masukkan kode kolam untuk melihat riwayat</p>
+                  </div>
+                )}
+
+                {(() => {
+                  if (!isSearchPerformed) return null;
+                  
+                  const filtered = reports
+                    .filter(r => {
+                      const pFilter = pondFilter.toLowerCase().trim();
+                      // Show both seed input and pond data in history
+                      const matchesSection = r.formSection === 'klarifikasi_ukuran' || r.formSection === 'data_masuk';
+                      
+                      if (!pFilter) return matchesSection;
+                      
+                      // Exact match check for pond code
+                      // If r.code contains multiple values separated by comma, check each one
+                      const codes = (r.code || '').split(',').map(c => c.trim().toLowerCase());
+                      const matchesPond = codes.includes(pFilter);
+                      
+                      return matchesSection && matchesPond;
+                    })
+                    .sort((a, b) => {
+                      const dateA = new Date(a.sorting_date || a.date).getTime();
+                      const dateB = new Date(b.sorting_date || b.date).getTime();
+                      return dateB - dateA;
+                    });
+
+                  if (filtered.length === 0) {
+                    return (
+                      <div className="min-w-full text-center py-12 bg-white/5 backdrop-blur-md rounded-3xl border border-white/10 animate-in fade-in zoom-in duration-300">
+                        <AlertCircle size={48} className="mx-auto mb-4 text-white/20" />
+                        <p className="text-white font-bold text-lg">Kode Tidak Ditemukan</p>
+                        <p className="text-emerald-100/60 text-xs mt-2 px-8">
+                          Tidak ada riwayat laporan untuk kode kolam <span className="text-white font-black">"{pondFilter}"</span>
+                        </p>
+                      </div>
+                    );
+                  }
+
+                  return filtered.map(report => (
+                    <div key={report.id} className="min-w-full snap-center">
+                      <Card className="p-5 border-none shadow-xl bg-[#e2e2d5] rounded-[32px] relative overflow-hidden">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="space-y-1.5">
+                            <span className="text-[11px] font-bold text-[#94a3b8] uppercase tracking-wider block ml-1">
+                              DATA KOLAM
+                            </span>
+                            <div className="inline-flex items-center px-4 py-2 bg-[#00c853] text-white rounded-xl font-bold text-lg shadow-sm">
+                              {report.code || '-'}
+                            </div>
+                          </div>
+                          <div className="text-right space-y-1.5">
+                            <span className="text-[11px] font-bold text-[#94a3b8] uppercase tracking-wider block mr-1">
+                              TGL SORTIR
+                            </span>
+                            <div className="inline-flex items-center gap-1.5 px-2.5 py-2 bg-white text-slate-700 rounded-xl font-bold text-[10px] shadow-sm whitespace-nowrap">
+                              <Calendar size={14} className="text-[#00c853]" />
+                              {report.sorting_date || report.date}
                             </div>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <button 
-                            onClick={() => handleEditReport(report)}
-                            className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-                            title="Edit"
-                          >
-                            <Edit size={14} />
-                          </button>
-                          <button 
-                            onClick={() => setDeleteConfirmId(report.id!)}
-                            className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg transition-colors"
-                            title="Hapus"
-                          >
-                            <Trash2 size={14} />
-                          </button>
-                          <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-1 rounded-full">
-                            {report.sorting_date}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="grid grid-cols-4 gap-2 text-center">
-                        <div className="bg-slate-50 p-2 rounded-lg">
-                          <p className="text-[8px] text-slate-400 font-bold uppercase">Panen</p>
-                          <p className="font-bold text-slate-700">{report.harvest}kg</p>
-                        </div>
-                        <div className="bg-slate-50 p-2 rounded-lg">
-                          <p className="text-[8px] text-slate-400 font-bold uppercase">Sedang</p>
-                          <p className="font-bold text-slate-700">{report.medium}kg</p>
-                        </div>
-                        <div className="bg-slate-50 p-2 rounded-lg">
-                          <p className="text-[8px] text-slate-400 font-bold uppercase">Kecil</p>
-                          <p className="font-bold text-slate-700">{report.small}kg</p>
-                        </div>
-                        <div className="bg-slate-50 p-2 rounded-lg">
-                          <p className="text-[8px] text-slate-400 font-bold uppercase">Jumbo</p>
-                          <p className="font-bold text-slate-700">{report.jumbo}kg</p>
-                        </div>
-                      </div>
-                      {report.notes && (
-                        <div className="mt-3 p-2 bg-slate-50 rounded-lg border border-slate-100 italic text-[10px] text-slate-600">
-                          {report.notes}
-                        </div>
-                      )}
-                    </Card>
-                  ))}
-                
-                {reports.filter(r => {
-                  const matchesSection = r.formSection === 'klarifikasi_ukuran';
-                  const matchesDate = r.sorting_date === (searchQuery || new Date().toISOString().split('T')[0]);
-                  const matchesPond = pondFilter === '' || r.code === pondFilter;
-                  const matchesNotes = notesFilter === '' || (r.notes && r.notes.toLowerCase().includes(notesFilter.toLowerCase()));
-                  return matchesSection && matchesDate && matchesPond && matchesNotes;
-                }).length === 0 && (
-                  <div className="text-center py-12 bg-white/5 backdrop-blur-md rounded-3xl border border-white/10">
-                    <AlertCircle size={48} className="mx-auto mb-4 text-white/20" />
-                    <p className="text-white font-medium">Tidak ada jadwal sortir yang sesuai</p>
-                    <p className="text-emerald-100/60 text-xs mt-1">Silakan sesuaikan filter atau input data baru</p>
-                  </div>
-                )}
+                      </Card>
+                    </div>
+                  ));
+                })()}
               </div>
             </div>
           )}
         </main>
 
-        {/* Bottom Navigation */}
-        {isLoggedIn && (
-          <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white/80 backdrop-blur-lg border-t border-slate-100 px-6 py-3 flex justify-between items-center z-50">
-          <button 
-            onClick={() => setView('home')}
-            className={cn("flex flex-col items-center gap-1 transition-colors", view === 'home' ? "text-emerald-600" : "text-slate-400")}
-          >
-            <FileText size={24} />
-            <span className="text-[10px] font-bold uppercase">Home</span>
-          </button>
-          <button 
-            onClick={() => {
-              setSearchQuery('');
-              setSelectedCommodity(null);
-              setView('search_landing');
-            }}
-            className={cn("flex flex-col items-center gap-1 transition-colors", (view === 'list' || view === 'search_landing') ? "text-emerald-600" : "text-slate-400")}
-          >
-            <Search size={24} />
-            <span className="text-[10px] font-bold uppercase">Hasil Pencarian</span>
-          </button>
-          
-          <button 
-            onClick={() => setView('stats')}
-            className={cn("flex flex-col items-center gap-1 transition-colors", view === 'stats' ? "text-emerald-600" : "text-slate-400")}
-          >
-            <BarChart3 size={24} />
-            <span className="text-[10px] font-bold uppercase">Analisa</span>
-          </button>
-          
-          <button 
-            onClick={() => setView('reminders')}
-            className={cn("flex flex-col items-center gap-1 transition-colors", view === 'reminders' ? "text-emerald-600" : "text-slate-400")}
-          >
-            <Calendar size={24} />
-            <span className="text-[10px] font-bold uppercase">Jadwal Sortir</span>
-          </button>
-          
-          <button 
-            onClick={() => setView('panen')}
-            className={cn("flex flex-col items-center gap-1 transition-colors", view === 'panen' ? "text-emerald-600" : "text-slate-400")}
-          >
-            <Anchor size={24} />
-            <span className="text-[10px] font-bold uppercase">Panen</span>
-          </button>
-        </nav>
-        )}
         {showSuccess && (
           <div className="fixed inset-0 flex items-center justify-center z-[100] animate-in fade-in duration-300">
             <div className="bg-black/40 backdrop-blur-sm absolute inset-0" />
@@ -2398,7 +3350,7 @@ export default function App() {
               <div className="text-center">
                 <h3 className="text-xl font-bold text-slate-900">Sukses!</h3>
                 <p className="text-slate-500">
-                  Data {view === 'bibit_list' ? 'bibit' : 'keramba'} berhasil disimpan
+                  Data {successType === 'bibit' ? 'bibit' : 'keramba'} berhasil disimpan
                 </p>
               </div>
             </div>
@@ -2406,5 +3358,6 @@ export default function App() {
         )}
       </div>
     </div>
+  </div>
   );
 }

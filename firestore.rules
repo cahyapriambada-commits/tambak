@@ -1,0 +1,145 @@
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: commodities
+// Fields:
+//   - uid: string (required) - User ID
+//   - name: string (required) - Name of the commodity
+//
+// Collection: reports
+// Fields:
+//   - uid: string (required) - User ID
+//   - date: string (required) - Date of report
+//   - commodity_id: string (required) - Reference to Commodity
+//   - commodity_name: string - Name of the commodity
+//   - code: string - Pond identifier/code
+//   - quantity: number - Quantity of fish
+//   - status: string - Health status
+//   - size_category: string - Size category
+//   - harvest: number - Harvest size count
+//   - medium: number - Medium size count
+//   - small: number - Small size count
+//   - jumbo: number - Jumbo size count
+//   - notes: string - Additional notes
+//   - sorting_date: string - Date for sorting
+//   - price: number - Price per unit
+//   - formSection: string - Section identifier
+//
+// Collection: harvests
+// Fields:
+//   - uid: string (required) - User ID
+//   - date: string (required) - Date of harvest
+//   - commodity_id: string (required) - Reference to Commodity
+//   - commodity_name: string - Name of the commodity
+//   - total_harvest: number - Total amount harvested
+//   - notes: string - Additional notes
+//
+// Collection: feed_data
+// Fields:
+//   - uid: string (required) - User ID
+//   - date: string (required) - Date of feeding
+//   - feed_type: string - Type of feed
+//   - quantity: number - Amount of feed
+//   - notes: string - Additional notes
+//
+// ===============================================================
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+    
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "cahyapriambada@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+    
+    function isValidCommodity(data) {
+      return data.uid == request.auth.uid &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 100;
+    }
+
+    function isValidReport(data) {
+      return data.uid == request.auth.uid &&
+             data.date is string &&
+             data.commodity_id is string &&
+             data.quantity is number &&
+             data.status is string;
+    }
+
+    function isValidHarvest(data) {
+      return data.uid == request.auth.uid &&
+             data.date is string &&
+             data.commodity_id is string &&
+             data.total_harvest is number;
+    }
+
+    function isValidFeedData(data) {
+      return data.uid == request.auth.uid &&
+             data.date is string &&
+             data.feed_type is string &&
+             data.quantity is number;
+    }
+
+    match /commodities/{id} {
+      allow read: if isAuthenticated() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidCommodity(request.resource.data);
+      allow update: if (isDocOwner() || isAdmin()) && isValidCommodity(request.resource.data) && uidUnchanged();
+      allow delete: if isDocOwner() || isAdmin();
+    }
+
+    match /reports/{id} {
+      allow read: if isAuthenticated() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidReport(request.resource.data);
+      allow update: if (isDocOwner() || isAdmin()) && isValidReport(request.resource.data) && uidUnchanged();
+      allow delete: if isDocOwner() || isAdmin();
+    }
+
+    match /harvests/{id} {
+      allow read: if isAuthenticated() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidHarvest(request.resource.data);
+      allow update: if (isDocOwner() || isAdmin()) && isValidHarvest(request.resource.data) && uidUnchanged();
+      allow delete: if isDocOwner() || isAdmin();
+    }
+
+    match /feed_data/{id} {
+      allow read: if isAuthenticated() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidFeedData(request.resource.data);
+      allow update: if (isDocOwner() || isAdmin()) && isValidFeedData(request.resource.data) && uidUnchanged();
+      allow delete: if isDocOwner() || isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isAuthenticated() && request.resource.data.role == 'user';
+      allow update: if (isOwner(userId) && request.resource.data.role == resource.data.role) || isAdmin();
+    }
+  }
+}

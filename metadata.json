@@ -1,7 +1,5 @@
 {
-  "name": "data tambak",
+  "name": "Data Tambak",
   "description": "Aplikasi manajemen data laporan petani tambak offline dengan fitur analisa, grafik, dan ekspor laporan (PDF/Excel).",
-  "requestFramePermissions": [
-    "camera"
-  ]
+  "requestFramePermissions": []
 }
